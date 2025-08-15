@@ -1,0 +1,57 @@
+name: live_audio_sampler
+description: A cross-platform audio sampler for live sound production
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.2
+  
+  # Audio processing
+  just_audio: ^0.9.36
+  audio_session: ^0.1.18
+  flutter_audio_waveforms: ^1.0.4
+  audio_waveforms: ^1.0.4
+  # For true pitch shifting, we need a different approach
+  # Consider using: flutter_audio_engine, audio_engine, or similar
+  
+  # File handling
+  file_picker: ^8.0.0+1
+  path_provider: ^2.1.1
+  
+  # State management
+  provider: ^6.1.1
+  
+  # UI components
+  flutter_staggered_grid_view: ^0.7.0
+  flutter_slidable: ^3.0.1
+  flutter_colorpicker: ^1.0.3
+  
+  # Utilities
+  permission_handler: ^11.3.1
+  shared_preferences: ^2.2.2
+  just_waveform: ^0.0.7
+  flutter_oknob: ^0.0.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+  
+  assets:
+    - assets/sounds/
+    - assets/images/
+  
+  # fonts:
+  #   - family: Roboto
+  #     fonts:
+  #       - asset: fonts/Roboto-Regular.ttf
+  #       - asset: fonts/Roboto-Bold.ttf
+  #         weight: 700 
