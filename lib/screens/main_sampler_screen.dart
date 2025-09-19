@@ -363,10 +363,15 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
       builder: (context, constraints) {
         // Calculate button size to fit grid in panel
         final double spacing = 6;
-        final double gridWidth = constraints.maxWidth - 2 * 12; // padding
-        final double gridHeight = constraints.maxHeight - 2 * 12; // padding
-        final double buttonWidth = (gridWidth - (6 - 1) * spacing) / 6;
-        final double buttonHeight = ((gridHeight - (4 - 1) * spacing) / 4) - 6;
+        final double maxWidth = constraints.maxWidth.isFinite ? constraints.maxWidth : 0;
+        final double maxHeight = constraints.maxHeight.isFinite ? constraints.maxHeight : 0;
+        final double gridWidth = max(maxWidth - 24, 0);
+        final double gridHeight = max(maxHeight - 24, 0);
+        final double buttonWidth = max((gridWidth - (6 - 1) * spacing) / 6, 0);
+        final double buttonHeight = max(((gridHeight - (4 - 1) * spacing) / 4) - 6, 0);
+        final double childAspectRatio = (buttonWidth > 0 && buttonHeight > 0)
+            ? buttonWidth / buttonHeight
+            : 1.0;
         return Padding(
           padding: const EdgeInsets.all(12),
           child: Consumer<SampleProvider>(
@@ -378,7 +383,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                   crossAxisCount: 6,
                   crossAxisSpacing: spacing,
                   mainAxisSpacing: spacing,
-                  childAspectRatio: buttonWidth / buttonHeight,
+                  childAspectRatio: childAspectRatio,
                 ),
                 itemCount: totalSlots,
                 itemBuilder: (context, index) {
