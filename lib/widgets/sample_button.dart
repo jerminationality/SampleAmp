@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import '../models/audio_sample.dart';
-import '../providers/audio_provider.dart';
-import '../providers/sample_provider.dart';
-import '../screens/main_sampler_screen.dart';
+import 'package:live_audio_sampler/models/audio_sample.dart';
+import 'package:live_audio_sampler/providers/audio_provider.dart';
+import 'package:live_audio_sampler/providers/sample_provider.dart';
+import 'package:live_audio_sampler/screens/main_sampler_screen.dart';
 
 class SampleButton extends StatefulWidget {
   final AudioSample sample;
@@ -30,7 +30,7 @@ class _SampleButtonState extends State<SampleButton>
   static OverlayEntry? _activeMenuEntry;
   late AnimationController _animationController;
   late Animation<double> _scaleAnimation;
-  bool _isPressed = false;
+  final bool _isPressed = false;
   final LayerLink _layerLink = LayerLink();
 
   @override
@@ -93,8 +93,9 @@ class _SampleButtonState extends State<SampleButton>
               builder: (context, child) {
                 return Transform.scale(
                   scale: _scaleAnimation.value,
-                  child: Container(
-                    height: 120,
+                  child: Stack(
+                    children: [
+                      Container(
                     decoration: BoxDecoration(
                       color: _getButtonColor(),
                       borderRadius: BorderRadius.circular(2),
@@ -104,7 +105,7 @@ class _SampleButtonState extends State<SampleButton>
                       ),
                       boxShadow: [
                         BoxShadow(
-                          color: Colors.black.withOpacity(0.2),
+                          color: Colors.black.withValues(alpha: 0.2),
                           blurRadius: 8,
                           offset: const Offset(0, 4),
                         ),
@@ -136,13 +137,16 @@ class _SampleButtonState extends State<SampleButton>
                         if (!widget.sample.isBlank) ...[
                         ],
                         if (widget.sample.isFavorite)
-                          Icon(
+                          const Icon(
                             Icons.favorite,
                             size: 16,
                             color: Colors.red,
                           ),
                       ],
                     ),
+                      ),
+                      // Loading spinner removed per request
+                    ],
                   ),
                 );
               },
@@ -161,14 +165,14 @@ class _SampleButtonState extends State<SampleButton>
     if (isPlaying) {
       return Theme.of(context).colorScheme.primary;
     } else if (_isPressed) {
-      return Theme.of(context).colorScheme.primary.withOpacity(0.7);
+  return Theme.of(context).colorScheme.primary.withValues(alpha: 0.7);
     } else if (!widget.sample.isBlank) {
       // For active samples, use custom color as background if available
       if (widget.sample.customColor != null) {
         return Color(widget.sample.customColor!);
       }
       // Active sample buttons (with audio) get a solid background color
-      return Theme.of(context).colorScheme.outline.withOpacity(0.3);
+  return Theme.of(context).colorScheme.outline.withValues(alpha: 0.3);
     } else {
       // Blank samples always use surface color for background
       return Theme.of(context).colorScheme.surface;
@@ -219,12 +223,7 @@ class _SampleButtonState extends State<SampleButton>
     }
   }
 
-  String _formatDuration(Duration duration) {
-    String twoDigits(int n) => n.toString().padLeft(2, '0');
-    final minutes = twoDigits(duration.inMinutes.remainder(60));
-    final seconds = twoDigits(duration.inSeconds.remainder(60));
-    return '$minutes:$seconds';
-  }
+  // Removed unused _formatDuration helper (no longer displayed on buttons)
 
   void _playSample() {
     if (widget.sample.isBlank) {
@@ -233,8 +232,10 @@ class _SampleButtonState extends State<SampleButton>
       final sampleProvider = Provider.of<SampleProvider>(context, listen: false);
       final latestSample = sampleProvider.getSampleById(widget.sample.id) ?? widget.sample;
       final audioProvider = Provider.of<AudioProvider>(context, listen: false);
+      // Always update current selection
       audioProvider.setCurrentSample(latestSample);
-      audioProvider.playSample(latestSample);
+  // Play regardless of waveform loading; waveform extraction runs in background
+  audioProvider.playSample(latestSample);
       // Also select the sample when tapped
       if (widget.onSelect != null) {
         widget.onSelect!();
@@ -294,7 +295,7 @@ class _SampleButtonState extends State<SampleButton>
                   border: Border.all(color: Colors.grey.shade200, width: 1),
                   boxShadow: [
                     BoxShadow(
-                      color: Colors.black.withOpacity(0.15),
+                      color: Colors.black.withValues(alpha: 0.15),
                       blurRadius: 12.0,
                       offset: const Offset(0, 4),
                       spreadRadius: 2,
@@ -306,11 +307,11 @@ class _SampleButtonState extends State<SampleButton>
                   children: [
                     _buildMenuItem('Select', 'select', overlayEntry!),
                     const Divider(height: 1, color: Colors.grey, indent: 8, endIndent: 8),
-                    _buildMenuItem('Change Color', 'color', overlayEntry!),
+                    _buildMenuItem('Change Color', 'color', overlayEntry),
                     const Divider(height: 1, color: Colors.grey, indent: 8, endIndent: 8),
-                    _buildMenuItem('Duplicate', 'duplicate', overlayEntry!),
+                    _buildMenuItem('Duplicate', 'duplicate', overlayEntry),
                     const Divider(height: 1, color: Colors.grey, indent: 8, endIndent: 8),
-                    _buildMenuItem('Delete', 'delete', overlayEntry!),
+                    _buildMenuItem('Delete', 'delete', overlayEntry),
                   ],
                 ),
               ),
@@ -399,7 +400,7 @@ class _SampleButtonState extends State<SampleButton>
               return GestureDetector(
                 onTap: () {
                   final sampleProvider = Provider.of<SampleProvider>(context, listen: false);
-                  sampleProvider.updateSampleColor(widget.sample.id, colors[index].value);
+                  sampleProvider.updateSampleColor(widget.sample.id, colors[index].toARGB32());
                   Navigator.of(context).pop();
                 },
                 child: Container(
@@ -423,25 +424,7 @@ class _SampleButtonState extends State<SampleButton>
     );
   }
 
-  String _getColorName(Color color) {
-    if (color == Colors.red) return 'Red';
-    if (color == Colors.orange) return 'Orange';
-    if (color == Colors.yellow) return 'Yellow';
-    if (color == Colors.green) return 'Green';
-    if (color == Colors.blue) return 'Blue';
-    if (color == Colors.indigo) return 'Indigo';
-    if (color == Colors.purple) return 'Purple';
-    if (color == Colors.pink) return 'Pink';
-    if (color == Colors.teal) return 'Teal';
-    if (color == Colors.cyan) return 'Cyan';
-    if (color == Colors.lime) return 'Lime';
-    if (color == Colors.amber) return 'Amber';
-    if (color == Colors.deepOrange) return 'Deep Orange';
-    if (color == Colors.deepPurple) return 'Deep Purple';
-    if (color == Colors.lightBlue) return 'Light Blue';
-    if (color == Colors.lightGreen) return 'Light Green';
-    return 'Custom';
-  }
+  // Removed unused _getColorName
 
   void _selectSample() {
     // Only select the sample, do not play audio

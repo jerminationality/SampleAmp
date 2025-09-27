@@ -1,11 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:flutter_staggered_grid_view/flutter_staggered_grid_view.dart';
-import '../providers/audio_provider.dart';
-import '../providers/sample_provider.dart';
-import '../models/audio_sample.dart';
-import 'sample_button.dart';
-import 'add_sample_button.dart';
+import 'package:live_audio_sampler/providers/audio_provider.dart';
+import 'package:live_audio_sampler/providers/sample_provider.dart';
+import 'package:live_audio_sampler/widgets/sample_button.dart';
+import 'package:live_audio_sampler/widgets/add_sample_button.dart';
 import 'package:file_picker/file_picker.dart';
 
 class SampleGrid extends StatelessWidget {
@@ -79,7 +78,7 @@ class _AddSampleDialogState extends State<AddSampleDialog> {
           Consumer<SampleProvider>(
             builder: (context, sampleProvider, child) {
               return DropdownButtonFormField<String>(
-                value: _selectedCategory,
+                initialValue: _selectedCategory,
                 decoration: const InputDecoration(
                   labelText: 'Category',
                   border: OutlineInputBorder(),
@@ -158,21 +157,22 @@ class _AddSampleDialogState extends State<AddSampleDialog> {
     }
 
     final duration = await audioProvider.getAudioDuration(filePath);
-    final waveformData = await audioProvider.generateWaveformData(filePath);
-    final newSample = AudioSample(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
+    // Add shell immediately so it appears in the grid
+    final shell = await sampleProvider.addSampleShell(
       name: _nameController.text.isEmpty ? 'New Sample' : _nameController.text,
       category: _selectedCategory,
       filePath: filePath,
       duration: duration,
       notes: _notesController.text.isEmpty ? null : _notesController.text,
-      createdAt: DateTime.now(),
-      lastModified: DateTime.now(),
-      waveformData: waveformData,
     );
-    await sampleProvider.addSample(newSample);
-    setState(() { _isLoading = false; });
-    Navigator.of(context).pop();
+  setState(() { _isLoading = false; });
+  if (!mounted) return;
+  Navigator.of(context).pop();
+    // Generate waveform asynchronously and update
+    final waveformData = await audioProvider.generateWaveformData(filePath);
+    if (waveformData != null) {
+      await sampleProvider.setSampleWaveform(shell.id, waveformData);
+    }
   }
 
   @override
@@ -181,4 +181,4 @@ class _AddSampleDialogState extends State<AddSampleDialog> {
     _notesController.dispose();
     super.dispose();
   }
-} 
+}
