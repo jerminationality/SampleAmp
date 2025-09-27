@@ -1,36 +1,68 @@
 import 'dart:async';
 import 'dart:math';
 import 'package:flutter/foundation.dart';
-import 'package:just_audio/just_audio.dart' as just_audio;
-import 'package:just_audio/just_audio.dart' show AudioSource, ClippingAudioSource;
-import '../models/audio_sample.dart';
-import 'package:audio_waveforms/audio_waveforms.dart' show extractWaveformData;
+import 'package:live_audio_sampler/models/audio_sample.dart';
 import 'package:just_waveform/just_waveform.dart';
 import 'dart:io';
-import 'package:flutter/material.dart';
-import 'package:flutter/widgets.dart';
-import '../utils.dart';
-import '../main.dart';
+import 'package:audio_session/audio_session.dart';
+// (removed) unused imports
+
+import 'package:live_audio_sampler/audio/engine/engine_factory.dart';
+import 'package:live_audio_sampler/audio/engine/engine_types.dart';
+import 'package:live_audio_sampler/audio/engine/soloud_engine.dart';
+import 'package:live_audio_sampler/audio/engine/soloud_ffi_engine.dart';
+import 'package:live_audio_sampler/audio/dsp/dsp_graph.dart';
 
 class AudioProvider with ChangeNotifier {
-  final just_audio.AudioPlayer _player = just_audio.AudioPlayer();
+  AudioEngine? _engine; // lazy
+  // No direct just_audio usage. Target backend is SoLoud; use engine APIs only.
+  // No direct backend-specific player exposure on unified provider.
+  dynamic get _ja => null; // placeholder for potential web-only streams later
+  // Provide a little digital headroom to avoid intermittent clipping/pops on devices/emulators
+  static const double _headroom = 0.8; // -1.94 dB approx
+  // Optional DSP graph (software processing before final engine volume)
+  DspGraph? _dspGraph;
+  int _loadToken = 0; // prevent races between overlapping loads
+  Timer? _pollTimer; // for non-just_audio engines
+  Timer? _smoothPlayheadTimer; // 60 FPS timer for smooth UI updates
   AudioSample? _currentSample;
   AudioSample? _playingSample; // Track which sample is actually playing
   bool _isPlaying = false;
   bool _isLoading = false;
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
+  Duration _lastNotifiedPosition = Duration.zero; // For throttling position updates
+  // Deprecated: previously used for throttling; retained variables below
   // Master volume in 0.0..1.0 (we keep headroom for positive sample gain)
   double _volume = 1.0;
   double _pitch = 1.0;
   double _reverb = 0.0;
   double _echo = 0.0;
+  // Stream subscriptions (unused with current abstraction)
   StreamSubscription<Duration>? _positionSubscription;
   StreamSubscription<Duration?>? _durationSubscription;
-  StreamSubscription<just_audio.PlayerState>? _playerStateSubscription;
+  StreamSubscription<dynamic>? _playerStateSubscription;
   // Baseline clip start/end in absolute file time when current source was loaded
   Duration _clipBaseStartAbs = Duration.zero;
-  Duration _clipBaseEndAbs = Duration.zero;
+  // Duration _clipBaseEndAbs removed (unused)
+  // Visual-only latency compensation so UI playhead can match audible output latency
+  Duration _latencyCompensation = Duration.zero;
+  bool _sessionActive = false; // track audio focus activation
+  bool _audibleStarted = false; // only advance playhead when audio actually started
+  // During this window we avoid kicking off heavy I/O (e.g., waveform extraction)
+  // right as playback starts to reduce contention on slower devices.
+  DateTime _ioQuietUntil = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // Smooth playhead prediction: remember last engine tick and base position
+  DateTime _lastEngineUpdateTime = DateTime.fromMillisecondsSinceEpoch(0);
+  Duration _baseEnginePosition = Duration.zero;
+  DateTime _lastNotifyTime = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // Debounce rapid trim changes (to avoid crackles when dragging)
+  Timer? _trimDebounce;
+  static const Duration _trimDebounceInterval = Duration(milliseconds: 80);
+  Duration? _pendingTrimStartAbs;
+  Duration? _pendingTrimEndAbs;
 
   AudioSample? get currentSample => _currentSample;
   AudioSample? get playingSample => _playingSample; // Getter for the sample that's actually playing
@@ -42,115 +74,299 @@ class AudioProvider with ChangeNotifier {
   double get pitch => _pitch;
   double get reverb => _reverb;
   double get echo => _echo;
+  Duration get latencyCompensation => _latencyCompensation;
+  DspGraph? get dspGraph => _dspGraph;
 
   AudioProvider() {
     _initializePlayer();
   }
 
-  void _initializePlayer() {
-    _positionSubscription = _player.positionStream.listen((position) {
-      _position = position;
-      notifyListeners();
-    });
+  /// Adjust visual latency compensation used by UI when rendering positions.
+  /// This does not change actual playback timing; only display.
+  void setLatencyCompensation(Duration value) {
+    _latencyCompensation = value < Duration.zero ? Duration.zero : value;
+    notifyListeners();
+  }
 
-    _durationSubscription = _player.durationStream.listen((duration) {
-      _duration = duration ?? Duration.zero;
-      notifyListeners();
-    });
-
-    _playerStateSubscription = _player.playerStateStream.listen((state) {
-      _isPlaying = state.playing;
-      _isLoading = state.processingState == just_audio.ProcessingState.loading ||
-                   state.processingState == just_audio.ProcessingState.buffering;
-      // Ensure isPlaying is false when playback completes
-      if (state.processingState == just_audio.ProcessingState.completed) {
-        _isPlaying = false;
-        _playingSample = null; // Clear the playing sample when playback completes
+  Future<void> _initializePlayer() async {
+    // Configure audio session (important on Android/iOS for playback)
+    () async {
+      try {
+        final session = await AudioSession.instance;
+        // Configure for media playback with speaker; stay active briefly when paused to reduce re-acquire
+        await session.configure(const AudioSessionConfiguration(
+          avAudioSessionCategory: AVAudioSessionCategory.playback,
+          avAudioSessionCategoryOptions: AVAudioSessionCategoryOptions.mixWithOthers,
+          avAudioSessionMode: AVAudioSessionMode.defaultMode,
+          androidAudioAttributes: AndroidAudioAttributes(
+            contentType: AndroidAudioContentType.music,
+            usage: AndroidAudioUsage.media,
+            flags: AndroidAudioFlags.none,
+          ),
+          androidWillPauseWhenDucked: false,
+        ));
+      } catch (e) {
+        // Best-effort
       }
-      notifyListeners();
+    }();
+  // Init engine (no-op for JA backend)
+  _engine ??= createAudioEngine();
+  if (kDebugMode) {
+    // ignore: avoid_print
+    print('[AudioProvider] attempting engine init: ${_engine.runtimeType}');
+  }
+  try {
+    await _engine!.init();
+  } catch (e, stack) {
+  if (kDebugMode) {
+      // ignore: avoid_print
+      print('[AudioProvider] primary engine init failed: ${e.runtimeType}: $e');
+      // ignore: avoid_print
+      print(stack);
+      // ignore: avoid_print
+      print('[AudioProvider] falling back to SoLoudEngine (just_audio shim)');
+    }
+    try {
+      _engine = SoLoudEngine();
+      await _engine!.init();
+    } catch (_) {
+      rethrow; // escalate if even fallback fails
+    }
+  }
+  if (kDebugMode) {
+    final engine = _engine;
+    if (engine is SoLoudFfiEngine) {
+      // ignore: avoid_print
+      print('[AudioProvider] active audio engine=SoLoud backend=${engine.debugBackendName ?? 'unknown'} (id=${engine.debugBackendId ?? -1}) sr=${engine.debugBackendSamplerate ?? 0} buf=${engine.debugBackendBufferSize ?? 0} ch=${engine.debugBackendChannels ?? 0}');
+    } else {
+      // ignore: avoid_print
+      print('[AudioProvider] active audio engine=${engine.runtimeType}');
+    }
+  }
+  // Create default DSP graph if supported in future; currently always instantiate
+  _dspGraph = DspGraph.basic(masterGain: 1.0, limiter: true);
+  if (_engine!.supportsDsp) {
+    try { await _engine!.setDspGraph(_dspGraph); } catch (_) {}
+  }
+  // Debug which engine is active
+  // Using audio engine: ${_engine.runtimeType} (USE_SOLOUD=$kUseSoLoud)
+    
+    // Start smooth 60 FPS playhead timer for UI updates
+    _startSmoothPlayheadTimer();
+    
+    // Poll engine for position/duration (common path for current engines)
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(const Duration(milliseconds: 75), (_) async {
+      try {
+        if (_engine == null) return;
+        final pos = await _engine!.position();
+        final dur = await _engine!.duration();
+        _updatePosition(pos);
+        _updateDuration(dur);
+      } catch (_) {}
     });
   }
 
+  Future<void> _ensureSessionActive() async {
+    try {
+      if (!_sessionActive) {
+        final session = await AudioSession.instance;
+        // Request/activate audio focus before starting playback
+        await session.setActive(true);
+        _sessionActive = true;
+      }
+    } catch (_) {
+      // Best-effort: if activation fails, continue; backend may still play
+    }
+  }
+
+  void _startSmoothPlayheadTimer() {
+    _smoothPlayheadTimer?.cancel();
+    // 60 FPS timer for smooth UI updates (16.67ms interval)
+    _smoothPlayheadTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
+  if (_audibleStarted) {
+        // Predict playhead between engine ticks using wall clock and current pitch
+        final now = DateTime.now();
+        final elapsedUs = now.difference(_lastEngineUpdateTime).inMicroseconds;
+        final predictedUs = _baseEnginePosition.inMicroseconds + (elapsedUs * _pitch).round();
+        var predicted = Duration(microseconds: predictedUs);
+
+        // Clamp to known duration
+        if (_duration > Duration.zero && predicted > _duration) {
+          predicted = _duration;
+        }
+        // Apply visual-only latency compensation
+        if (_latencyCompensation > Duration.zero && predicted > _latencyCompensation) {
+          predicted -= _latencyCompensation;
+        }
+
+        if (predicted != _position) {
+          _position = predicted;
+        }
+        _notifyIfNeeded();
+      }
+    });
+  }
+
+  void _updatePosition(Duration newPosition) {
+    if (_position != newPosition) {
+  _position = newPosition;
+  _baseEnginePosition = newPosition;
+  _lastEngineUpdateTime = DateTime.now();
+    }
+  }
+
+  void _updateDuration(Duration newDuration) {
+    if (_duration != newDuration) {
+      _duration = newDuration;
+      _notifyIfNeeded();
+    }
+  }
+
+  void _notifyIfNeeded() {
+    final now = DateTime.now();
+    final sinceLastNotifyMs = now.difference(_lastNotifyTime).inMilliseconds;
+    final positionDiffMs = (_position - _lastNotifiedPosition).inMilliseconds.abs();
+
+    final shouldNotify = positionDiffMs >= 16 || (!_isPlaying && positionDiffMs > 0) || sinceLastNotifyMs >= 33;
+    if (shouldNotify) {
+      _lastNotifiedPosition = _position;
+      _lastNotifyTime = now;
+      notifyListeners();
+    }
+  }
+
   // Compute normalized gain with +12 dB headroom so positive gain has effect
-  double _normalizedGainFromDb(double gainDb) {
-    const double headroomDb = 12.0; // matches UI max
+  double _gainAmplitude(double gainDb) {
+    // Map gain dB to linear amplitude with 0 dB => 1.0; positive gains clamp to 1.0 (no extra headroom at engine level)
     final double amplitude = pow(10.0, gainDb / 20.0).toDouble();
-    final double maxAmplitude = pow(10.0, headroomDb / 20.0).toDouble();
-    return (amplitude / maxAmplitude).clamp(0.0, 1.0);
+    return amplitude.clamp(0.0, 1.0);
+  }
+
+  // Easing functions for smooth volume transitions
+  double _easeOut(double t) {
+    return (1 - pow(1 - t, 3)).toDouble();
+  }
+
+  // Enhanced volume ramping with higher resolution and easing curves
+  Future<void> _rampVolume(
+    double from, 
+    double to, {
+    int steps = 8, 
+    Duration totalDuration = const Duration(milliseconds: 80),
+    bool useEasing = true,
+  }) async {
+    if ((to - from).abs() < 1e-6 || steps <= 0) {
+  await _engine?.setVolume(to);
+      return;
+    }
+
+    final int stepMs = (totalDuration.inMilliseconds ~/ steps).clamp(1, 50);
+    final double volumeRange = to - from;
+    for (int i = 1; i <= steps; i++) {
+      final double progress = i / steps;
+      final double eased = useEasing ? _easeOut(progress) : progress;
+      final double target = from + (volumeRange * eased);
+  await _engine?.setVolume(target);
+      if (i < steps) {
+        await Future.delayed(Duration(milliseconds: stepMs));
+      }
+    }
   }
 
   Future<void> _applyEffectiveVolume() async {
     double gainFactor = 1.0;
     if (_currentSample != null) {
-      gainFactor = _normalizedGainFromDb(_currentSample!.gainDb);
+      gainFactor = _gainAmplitude(_currentSample!.gainDb);
     }
-    final double effective = (_volume.clamp(0.0, 1.0)) * gainFactor;
-    await _player.setVolume(effective);
+    final double effective = (_volume.clamp(0.0, 1.0)) * gainFactor * _headroom;
+  // If future engine provides per-sample PCM hook, DSP graph would run there.
+  // For now we only adjust engine volume factoring headroom.
+  await _engine?.setVolume(effective);
   }
 
   Future<void> loadSample(AudioSample sample) async {
     try {
+      final int token = ++_loadToken;
+  // If waveform is still analyzing, proceed with audio load
       _isLoading = true;
       notifyListeners();
 
-      // Debug: Print sample info
-      print('[AudioProvider] Loading sample:');
-      print('  filePath: \'${sample.filePath}\'');
-      print('  duration: ${sample.duration}');
-      print('  startTime: ${sample.startTime}');
-      print('  endTime: ${sample.endTime}');
-      print('  isTrimmed: ${sample.isTrimmed}');
+  //
 
-      // Generate waveform data if missing
-      if (sample.waveformData == null || sample.waveformData!.isEmpty) {
-        final waveformData = await generateWaveformData(sample.filePath);
-        sample = sample.copyWith(waveformData: waveformData);
+  // Ensure audio focus is active as early as possible for reliable first playback
+  await _ensureSessionActive();
+
+      // If currently playing, ramp down and pause to avoid pops when swapping source
+  if (_isPlaying && _engine != null) {
+        final double targetVol = (_volume.clamp(0.0, 1.0)) * (_currentSample != null ? _gainAmplitude(_currentSample!.gainDb) : 1.0) * _headroom;
+        await _rampVolume(targetVol, 0.0, totalDuration: const Duration(milliseconds: 50), steps: 8);
+  await _engine?.pause();
+        _isPlaying = false;
       }
 
-      _currentSample = sample;
+      // Generate waveform data if missing, but delay slightly and skip if currently playing
+      // or within the I/O quiet window to avoid interference at playback start.
+  if (!sample.isWaveformLoading && (sample.waveformData == null || sample.waveformData!.isEmpty)) {
+        // ignore: unawaited_futures
+        Future.delayed(const Duration(milliseconds: 400), () async {
+          if (token != _loadToken) return; // another load started
+          if (_isPlaying) return; // avoid running heavy extraction while user starts playback
+          if (DateTime.now().isBefore(_ioQuietUntil)) return; // respect quiet window
+          if (_currentSample?.id != sample.id) return; // sample changed
+          final waveformData = await generateWaveformData(sample.filePath);
+          if (waveformData != null && waveformData.isNotEmpty) {
+            // Upstream can refresh model elsewhere if desired
+          }
+        });
+      }
+
+  // Always replace current sample to ensure correct source per tap
+  // debug
+  // print('loadSample: id=${sample.id} path=${sample.filePath} start=${sample.startTime.inMilliseconds} end=${sample.endTime.inMilliseconds}');
+  _currentSample = sample;
       _playingSample = sample; // Set the playing sample when loading
-      // Set audio source with or without trimming
-      AudioSource source;
-      if (sample.isTrimmed) {
-        final endTime = (sample.endTime > Duration.zero && sample.endTime < sample.duration)
+      // SoLoud-first behavior: load full file, apply clip via engine.setClip
+  await _engine!.load(sample.filePath, start: Duration.zero, end: null);
+  if (token != _loadToken) return; // a newer load started; abort
+  if (sample.isTrimmed) {
+        final effectiveEnd = (sample.endTime > Duration.zero && sample.endTime < sample.duration)
             ? sample.endTime
-            : null;
-        source = ClippingAudioSource(
-          child: AudioSource.uri(Uri.file(sample.filePath)),
-          start: sample.startTime,
-          end: endTime,
-        );
-        print('[AudioProvider] Using ClippingAudioSource:');
-        print('  filePath: \'${sample.filePath}\'');
-        print('  start: ${sample.startTime}');
-        print('  end: $endTime');
+            : sample.duration;
+  await _engine!.setClip(start: sample.startTime, end: effectiveEnd);
       } else {
-        source = AudioSource.uri(Uri.file(sample.filePath));
-        print('[AudioProvider] Using AudioSource.uri for file');
+  await _engine!.setClip(start: null, end: null);
       }
-
-      await _player.setAudioSource(source);
-      print('[AudioProvider] Called setAudioSource');
+  if (token != _loadToken) return;
+  // Engine loaded source
 
       // Track baseline absolute clip window for in-place trim updates
-      _clipBaseStartAbs = sample.startTime;
-      _clipBaseEndAbs = (sample.endTime > Duration.zero && sample.endTime < sample.duration)
-          ? sample.endTime
-          : sample.duration;
+  // Baseline is full file in SoLoud flow
+  _clipBaseStartAbs = Duration.zero;
+  // _clipBaseEndAbs was unused; removed
 
-      // Apply combined master volume and normalized sample gain with headroom
-      await _applyEffectiveVolume();
-      final gainNorm = _normalizedGainFromDb(sample.gainDb);
-      print('[AudioProvider] Applied sample gain: ${sample.gainDb} dB (normalized factor: ${gainNorm.toStringAsFixed(3)}) with master volume ${_volume.toStringAsFixed(3)}');
+  // Apply combined master volume and sample gain (0 dB => 1.0; positive gains clamp at 1.0)
+  await _applyEffectiveVolume();
+  // Applied sample gain: ${sample.gainDb} dB
 
-      // Always seek to zero (the clip start is handled by ClippingAudioSource)
-      await _player.seek(Duration.zero);
-      print('[AudioProvider] Called seek(0) after setAudioSource');
-      print('[AudioProvider] Player position after seek: ${_player.position}');
+      // Always start at the beginning for a fresh load to avoid end-of-clip no-audio on first tap
+      if (sample.isTrimmed) {
+        // Clip-relative: start from 0 within the clip window
+        final Duration relStart = Duration.zero;
+  await _engine!.seek(relStart);
+        _position = relStart;
+      } else {
+        // Absolute timeline: start from the sample's startTime
+        final Duration absStart = sample.startTime;
+  await _engine!.seek(absStart);
+        _position = absStart;
+      }
+  // Query final position for potential future use
+  await _engine!.position();
       _isLoading = false;
       notifyListeners();
     } catch (e) {
-      print('[AudioProvider] Error loading sample: $e');
+  // Error loading sample: $e
       _isLoading = false;
       notifyListeners();
     }
@@ -158,53 +374,169 @@ class AudioProvider with ChangeNotifier {
 
   Future<void> play() async {
     if (_currentSample != null) {
+  // Enter a short I/O quiet window around playback to reduce startup races
+  _ioQuietUntil = DateTime.now().add(const Duration(milliseconds: 600));
+  // Make sure the platform audio session is active (fixes first-tap no-audio)
+  await _ensureSessionActive();
+      // Compute effective target volume before starting (master * normalized gain)
+  double effectiveTargetVolume() => (_volume.clamp(0.0, 1.0)) * _gainAmplitude(_currentSample!.gainDb) * _headroom;
+
       final start = _currentSample!.startTime;
       final end = (_currentSample!.endTime > Duration.zero && _currentSample!.endTime < _currentSample!.duration)
           ? _currentSample!.endTime
           : _currentSample!.duration;
-      print('[AudioProvider] play() called. Current position: $_position, start: $start, end: $end');
+  // debug
+  // print('play(): pos=${_position.inMilliseconds} start=${start.inMilliseconds} end=${end.inMilliseconds}');
       if (start >= end) {
-        print('[AudioProvider] WARNING: startTime >= endTime. Will not play.');
+  // startTime >= endTime. Will not play.
         return;
       }
       
-      // For ClippingAudioSource, we need to seek relative to the clip, not the original file
+      // Always clamp and seek before play to ensure backend starts reliably
+      // Determine the intended playback start (for warm-up fallback)
+      Duration playStartPos;
       if (_currentSample!.isTrimmed) {
-        // ClippingAudioSource: Duration.zero is the start of the clip
-        final clipEnd = end - start; // Duration of the clip
-        if (_position < Duration.zero || _position > clipEnd) {
-          print('[AudioProvider] Seeking to clip start (Duration.zero) (current position: $_position)');
-          await _player.seek(Duration.zero);
-          _position = Duration.zero;
-          print('[AudioProvider] Called seek(0) before play');
+        // Clipped playback: Duration.zero is clip start
+        final clipEnd = end - start;
+        Duration clamped = _position;
+        if (clamped >= clipEnd) {
+          // If we're at end, restart at clip start to guarantee audible output
+          clamped = Duration.zero;
+        } else if (clamped < Duration.zero) {
+          clamped = Duration.zero;
         }
+  await _engine?.seek(clamped);
+        _position = clamped;
+        playStartPos = clamped;
       } else {
-        // Regular AudioSource: seek relative to original file
-        if (_position < start || _position > end) {
-          print('[AudioProvider] Seeking to start: $start (current position: $_position)');
-          await _player.seek(start);
-          _position = start;
-          print('[AudioProvider] Called seek($start) before play');
+        // Full-track playback: clamp to [start, end) and restart at start if at end
+        Duration clamped = _position;
+        if (clamped >= end) {
+          clamped = start;
+        } else if (clamped < start) {
+          clamped = start;
         }
+  await _engine?.seek(clamped);
+        _position = clamped;
+        playStartPos = clamped;
       }
-      print('[AudioProvider] Calling play()');
-      await _player.play();
+  // Anti-pop and optional warm-up: only warm up once on Android; otherwise do a normal ramp
+  final targetVol = effectiveTargetVolume();
+  final bool engineNeedsRamp = _engine?.needsStartupRamp ?? true;
+  if (!engineNeedsRamp) {
+    await _engine!.setVolume(targetVol);
+    _isPlaying = true;
+    await _engine!.play();
+    _audibleStarted = true;
+    return;
+  }
+  // Warm-up on Android when the engine requires it to avoid intermittent pipeline silence
+  final bool shouldWarmUp = !kIsWeb && defaultTargetPlatform == TargetPlatform.android && engineNeedsRamp;
+  if (shouldWarmUp) {
+    // Tiny epsilon to prime the pipeline
+    final double eps = (() {
+      final v = targetVol * 0.01; // 1% of target
+      if (v.isNaN || v.isInfinite) return 0.01;
+      return v.clamp(0.005, 0.05);
+    })();
+  await _engine!.setVolume(eps);
+    _isPlaying = true;
+  await _engine?.play();
+    // Wait briefly for position to advance
+    bool advanced = false;
+  try {
+  final Duration startPos = _position;
+      const int maxWaitMs = 300;
+      const int stepMs = 10;
+      int waited = 0;
+      while (waited < maxWaitMs) {
+  final p = await _engine!.position();
+        if (p > startPos) {
+          _updatePosition(p);
+          advanced = true;
+          break;
+        }
+        await Future.delayed(const Duration(milliseconds: stepMs));
+        waited += stepMs;
+      }
+    } catch (_) {}
+    if (!advanced) {
+      // Warm-up fallback: quick pause/re-seek/play
+      try {
+  await _engine!.pause();
+        await Future.delayed(const Duration(milliseconds: 10));
+  await _engine!.seek(playStartPos);
+  await _engine!.play();
+      } catch (_) {}
+    }
+    await Future.delayed(const Duration(milliseconds: 20));
+  await _rampVolume(eps, targetVol, totalDuration: const Duration(milliseconds: 60), steps: 8);
+  _audibleStarted = true;
+  } else {
+  await _engine!.setVolume(0.0);
+    _isPlaying = true;
+  await _engine!.play();
+    await Future.delayed(const Duration(milliseconds: 10));
+  await _rampVolume(0.0, targetVol, totalDuration: const Duration(milliseconds: 60), steps: 8);
+  _audibleStarted = true;
+  }
     }
   }
 
   Future<void> pause() async {
-    await _player.pause();
+    // Anti-pop: ramp down quickly before pausing, then restore target level while paused
+  double targetVol = (_volume.clamp(0.0, 1.0)) * (_currentSample != null ? _gainAmplitude(_currentSample!.gainDb) : 1.0) * _headroom;
+
+  await _rampVolume(targetVol, 0.0, totalDuration: const Duration(milliseconds: 80), steps: 8);
+    await _engine!.pause();
+  _isPlaying = false;
+  await _engine!.setVolume(targetVol);
+  _audibleStarted = false;
   }
 
   Future<void> stop() async {
-    await _player.stop();
+    if (!_isPlaying && !_audibleStarted) {
+      _position = Duration.zero;
+      _playingSample = null;
+      notifyListeners();
+      return;
+    }
+    // Anti-pop: ramp down quickly before stopping, then restore target level
+  double targetVol = (_volume.clamp(0.0, 1.0)) * (_currentSample != null ? _gainAmplitude(_currentSample!.gainDb) : 1.0) * _headroom;
+
+  await _rampVolume(targetVol, 0.0, totalDuration: const Duration(milliseconds: 80), steps: 8);
+    await _engine!.stop();
+  _isPlaying = false;
+  await _engine!.setVolume(targetVol);
     _position = Duration.zero;
     _playingSample = null; // Clear the playing sample when stopped
+  _audibleStarted = false;
+    // Release audio focus when fully stopped
+    try {
+      if (_sessionActive) {
+        final session = await AudioSession.instance;
+        await session.setActive(false);
+        _sessionActive = false;
+      }
+    } catch (_) {}
     notifyListeners();
   }
 
   Future<void> seek(Duration position) async {
     if (_currentSample != null) {
+      // Helper: quick anti-pop ramp around seeks when currently playing and performing a significant jump
+  Future<void> rampForSeek(Future<void> Function() doSeek) async {
+        if (_isPlaying) {
+          final targetVol = (_volume.clamp(0.0, 1.0)) * _gainAmplitude(_currentSample!.gainDb) * _headroom;
+          // Ramp down, perform seek, then ramp back up using enhanced ramping
+          await _rampVolume(targetVol, 0.0, totalDuration: const Duration(milliseconds: 50), steps: 8);
+          await doSeek();
+          await _rampVolume(0.0, targetVol, totalDuration: const Duration(milliseconds: 50), steps: 8);
+        } else {
+          await doSeek();
+        }
+      }
+
       final start = _currentSample!.startTime;
       final end = (_currentSample!.endTime > Duration.zero && _currentSample!.endTime < _currentSample!.duration)
           ? _currentSample!.endTime
@@ -215,18 +547,20 @@ class AudioProvider with ChangeNotifier {
         // ClippingAudioSource: clamp relative to the clip
         final clipEnd = end - start; // Duration of the clip
         clamped = position < Duration.zero ? Duration.zero : (position > clipEnd ? clipEnd : position);
-        print('[AudioProvider] seek() called (clipped). Requested: $position, clamped: $clamped, clipEnd: $clipEnd');
+  // seek() called (clipped). Requested: $position, clamped: $clamped, clipEnd: $clipEnd
       } else {
         // Regular AudioSource: clamp relative to original file
         clamped = position < start ? start : (position > end ? end : position);
-        print('[AudioProvider] seek() called (regular). Requested: $position, clamped: $clamped, start: $start, end: $end');
+  // seek() called (regular). Requested: $position, clamped: $clamped, start: $start, end: $end
       }
       
-      await _player.seek(clamped);
+  await rampForSeek(() async {
+    await _engine!.seek(clamped);
+      });
       _position = clamped;
       notifyListeners();
     } else {
-      await _player.seek(position);
+  await _engine!.seek(position);
     }
   }
 
@@ -239,7 +573,7 @@ class AudioProvider with ChangeNotifier {
 
   Future<void> setPitch(double pitch) async {
     _pitch = pitch.clamp(0.5, 2.0);
-    await _player.setSpeed(_pitch);
+  await _engine!.setSpeed(_pitch);
     notifyListeners();
   }
 
@@ -281,37 +615,41 @@ class AudioProvider with ChangeNotifier {
 
   Future<void> loopSample(AudioSample sample) async {
     await loadSample(sample);
-    await _player.setLoopMode(just_audio.LoopMode.one);
+  await _engine?.setLooping(true);
+  await _ensureSessionActive();
     await play();
   }
 
   Future<void> stopLoop() async {
-    await _player.setLoopMode(just_audio.LoopMode.off);
+  await _engine?.setLooping(false);
     await stop();
   }
 
   Future<void> fadeIn(Duration duration) async {
-    await _player.setVolume(0.0);
+  await _engine!.setVolume(0.0);
+  await _ensureSessionActive();
     await play();
 
-    final steps = 50;
+    const steps = 50;
     final stepDuration = duration.inMilliseconds ~/ steps;
     final volumeStep = _volume / steps;
 
     for (int i = 1; i <= steps; i++) {
-      await Future.delayed(Duration(milliseconds: stepDuration));
-      await _player.setVolume(volumeStep * i);
+  await Future.delayed(Duration(milliseconds: stepDuration));
+  await _engine!.setVolume(volumeStep * i);
     }
   }
 
+  
+
   Future<void> fadeOut(Duration duration) async {
-    final steps = 50;
+    const steps = 50;
     final stepDuration = duration.inMilliseconds ~/ steps;
     final volumeStep = _volume / steps;
 
     for (int i = steps; i > 0; i--) {
-      await Future.delayed(Duration(milliseconds: stepDuration));
-      await _player.setVolume(volumeStep * i);
+  await Future.delayed(Duration(milliseconds: stepDuration));
+  await _engine!.setVolume(volumeStep * i);
     }
 
     await stop();
@@ -319,10 +657,12 @@ class AudioProvider with ChangeNotifier {
 
   Future<void> applyTrim(Duration startTime, Duration endTime) async {
     if (_currentSample != null) {
-      print('[AudioProvider] applyTrim() requested: start=$startTime end=$endTime for sample=${_currentSample!.id}');
-      print('[AudioProvider]    BEFORE setClip: position=${_player.position} isPlaying=$_isPlaying baseStart=$_clipBaseStartAbs baseEnd=$_clipBaseEndAbs');
-      await _player.setClip(start: startTime, end: endTime);
-      print('[AudioProvider]    AFTER setClip: position=${_player.position}');
+  // applyTrim() requested: start=$startTime end=$endTime
+  // BEFORE setClip
+      if (_ja != null) {
+      await _ja!.setClip(start: startTime, end: endTime);
+      }
+  // AFTER setClip
     }
   }
 
@@ -338,35 +678,47 @@ class AudioProvider with ChangeNotifier {
         ? newEndAbs
         : fullDuration;
 
-    // Compute offsets relative to the baseline clip start used when the source was loaded
-    Duration relStart = effectiveStartAbs - _clipBaseStartAbs;
-    if (relStart.isNegative) relStart = Duration.zero;
-    Duration relEnd = effectiveEndAbs - _clipBaseStartAbs;
-    if (relEnd < Duration.zero) relEnd = Duration.zero;
+    // Debounce rapid changes to avoid crackles
+    _pendingTrimStartAbs = effectiveStartAbs;
+    _pendingTrimEndAbs = effectiveEndAbs;
+    _trimDebounce?.cancel();
+  _trimDebounce = Timer(_trimDebounceInterval + const Duration(milliseconds: 40), () async {
+      if (_currentSample == null) return;
+      final Duration startAbs = _pendingTrimStartAbs ?? _currentSample!.startTime;
+      final Duration endAbs = _pendingTrimEndAbs ??
+          ((_currentSample!.endTime > Duration.zero && _currentSample!.endTime < fullDuration)
+              ? _currentSample!.endTime
+              : fullDuration);
 
-    print('[AudioProvider] applyTrimRelativeForCurrent():');
-    print('  input newStartAbs=$newStartAbs newEndAbs=$newEndAbs');
-    print('  fullDuration=$fullDuration baseStartAbs=$_clipBaseStartAbs');
-    print('  computed relStart=$relStart relEnd=$relEnd');
-    print('  BEFORE setClip: position=${_player.position} isPlaying=$_isPlaying for sample=${_currentSample!.id}');
-    // Always set both start and end together for reliability
-    await _player.setClip(start: relStart, end: relEnd);
-    print('  AFTER setClip: position=${_player.position}');
+      Duration relStart = startAbs - _clipBaseStartAbs;
+      if (relStart.isNegative) relStart = Duration.zero;
+      Duration relEnd = endAbs - _clipBaseStartAbs;
+      if (relEnd < Duration.zero) relEnd = Duration.zero;
 
-    // Update current sample to reflect new absolute trim window
-    _currentSample = _currentSample!.copyWith(startTime: effectiveStartAbs, endTime: effectiveEndAbs);
-    print('  updated currentSample: start=${_currentSample!.startTime} end=${_currentSample!.endTime}');
+  // Quick ramp to reduce pops around engine.setClip
+  final double targetVol = (_volume.clamp(0.0, 1.0)) * (_currentSample != null ? _gainAmplitude(_currentSample!.gainDb) : 1.0) * _headroom;
+  final bool wasPlaying = _isPlaying;
+  await _rampVolume(targetVol, 0.0, totalDuration: const Duration(milliseconds: 60), steps: 8);
+  if (wasPlaying && _audibleStarted) {
+  await _engine!.pause();
+  }
+  await _engine!.setClip(start: relStart, end: relEnd);
+  // Ensure the playhead is within the new clip while volume is down
+  final currentPos = await _engine!.position();
+  final clipLen = relEnd - relStart;
+  Duration clamped = currentPos;
+  if (clamped < Duration.zero) clamped = Duration.zero;
+  if (clipLen > Duration.zero && clamped > clipLen) clamped = clipLen;
+  await _engine!.seek(clamped);
+  if (wasPlaying && _audibleStarted) {
+  await _engine!.play();
+  }
+  await _rampVolume(0.0, targetVol, totalDuration: const Duration(milliseconds: 60), steps: 8);
 
-    // If current position is past new end, stop playback to respect new boundary
-    final currentPos = _player.position;
-    final clipEnd = relEnd - relStart;
-    print('  post-check: currentPos=$currentPos clipEnd=$clipEnd');
-    if (currentPos > clipEnd) {
-      // Seek to end of clip and pause to avoid running past
-      await _player.seek(clipEnd);
-      await _player.pause();
-      print('  clamped playback to clipEnd and paused');
-    }
+      _currentSample = _currentSample!.copyWith(startTime: startAbs, endTime: endAbs);
+      // No pause here; keep state as-is since we've already clamped while volume was down
+      _notifyIfNeeded();
+    });
   }
 
   Future<void> resetEffects() async {
@@ -374,16 +726,22 @@ class AudioProvider with ChangeNotifier {
     _pitch = 1.0;
     _reverb = 0.0;
     _echo = 0.0;
-    await _applyEffectiveVolume();
+  await _applyEffectiveVolume();
+    // Reset DSP graph parameters (recreate for simplicity)
+    _dspGraph?.dispose();
+    _dspGraph = DspGraph.basic(masterGain: 1.0, limiter: true);
+    if (_engine?.supportsDsp == true) {
+      try { await _engine!.setDspGraph(_dspGraph); } catch (_) {}
+    }
   }
 
   void setCurrentSample(AudioSample sample) {
     _currentSample = sample;
     // Reset baseline window so the next trim operations are relative to this sample
     _clipBaseStartAbs = sample.startTime;
-    _clipBaseEndAbs = (sample.endTime > Duration.zero && sample.endTime < sample.duration)
-        ? sample.endTime
-        : sample.duration;
+  // _clipBaseEndAbs removed (unused)
+  _baseEnginePosition = _position;
+  _lastEngineUpdateTime = DateTime.now();
     notifyListeners();
   }
 
@@ -393,18 +751,7 @@ class AudioProvider with ChangeNotifier {
       // Keep provider's current sample in sync
       _currentSample = sample;
       await _applyEffectiveVolume();
-      final gainNorm = _normalizedGainFromDb(sample.gainDb);
-      print('[AudioProvider] Updated sample gain: ${sample.gainDb} dB (normalized factor: ${gainNorm.toStringAsFixed(3)}) with master volume ${_volume.toStringAsFixed(3)}');
-      
-      // Debug: Show the expected volume change relative to original (no headroom normalization)
-      final amplitude = pow(10.0, sample.gainDb / 20.0).toDouble();
-      if (sample.gainDb > 0) {
-        print('[AudioProvider] Volume boost: ${sample.gainDb} dB = ${(amplitude * 100).toStringAsFixed(1)}% of original');
-      } else if (sample.gainDb < 0) {
-        print('[AudioProvider] Volume reduction: ${sample.gainDb} dB = ${(amplitude * 100).toStringAsFixed(1)}% of original');
-      } else {
-        print('[AudioProvider] Unity gain: 0 dB = 100% of original');
-      }
+  // Updated sample gain: ${sample.gainDb} dB
       
       notifyListeners();
     }
@@ -413,15 +760,8 @@ class AudioProvider with ChangeNotifier {
 
   /// Get actual duration of an audio file
   Future<Duration> getAudioDuration(String filePath) async {
-    try {
-      final player = just_audio.AudioPlayer();
-      await player.setFilePath(filePath);
-      final duration = await player.duration;
-      await player.dispose();
-      return duration ?? Duration.zero;
-    } catch (e) {
-      return Duration.zero;
-    }
+  // Not implemented without direct just_audio dependency; return zero (caller can ignore or compute when loading sample).
+  return Duration.zero;
   }
 
   /// Generate waveform data for an audio file using just_waveform
@@ -438,13 +778,14 @@ class AudioProvider with ChangeNotifier {
           // Generate proper mirrored waveform data
           final int pixelCount = waveform.length;
           final bool is16bit = waveform.flags == 0;
-          final double maxVal = is16bit ? 32768.0 : 128.0;
+          final double maxAbs = is16bit ? 32768.0 : 128.0;
+          // Use peak magnitude per pixel and normalize to [0,1] so renderers can mirror evenly
           final samples = List<double>.generate(pixelCount, (i) {
-            final min = waveform.getPixelMin(i).toDouble();
-            final max = waveform.getPixelMax(i).toDouble();
-            // Normalize to [-1, 1] range for proper mirrored display
-            final amplitude = ((max + min) / 2) / maxVal;
-            return amplitude.clamp(-1.0, 1.0);
+            final double minV = waveform.getPixelMin(i).toDouble();
+            final double maxV = waveform.getPixelMax(i).toDouble();
+            final double peak = (minV.abs() > maxV.abs()) ? minV.abs() : maxV.abs();
+            final double amplitude = (peak / maxAbs).clamp(0.0, 1.0);
+            return amplitude;
           });
           
           // Debug the generated waveform data
@@ -470,86 +811,16 @@ class AudioProvider with ChangeNotifier {
   /// Debug method to print waveform data statistics
   void debugWaveformData(List<double> waveformData) {
     if (waveformData.isEmpty) {
-      print('[Waveform Debug] Empty waveform data');
+  // Waveform debug: empty data
       return;
     }
-    
-    final min = waveformData.reduce((a, b) => a < b ? a : b);
-    final max = waveformData.reduce((a, b) => a > b ? a : b);
-    final avg = waveformData.reduce((a, b) => a + b) / waveformData.length;
-    final negativeCount = waveformData.where((v) => v < 0).length;
-    final positiveCount = waveformData.where((v) => v > 0).length;
-    final zeroCount = waveformData.where((v) => v == 0).length;
-    
-    print('[Waveform Debug] Data points: ${waveformData.length}');
-    print('[Waveform Debug] Range: $min to $max');
-    print('[Waveform Debug] Average: $avg');
-    print('[Waveform Debug] Negative values: $negativeCount');
-    print('[Waveform Debug] Positive values: $positiveCount');
-    print('[Waveform Debug] Zero values: $zeroCount');
-    print('[Waveform Debug] First 10 values: ${waveformData.take(10).toList()}');
-  }
-
-  /// Generate a realistic waveform pattern based on audio file properties
-  List<double> _generateRealisticWaveform(String filePath, Duration duration) {
-    final List<double> waveformData = [];
-    final int dataPoints = 100;
-
-    // Use file properties to create unique, realistic patterns
-    final fileName = filePath.split('/').last;
-    final fileNameHash = fileName.hashCode;
-    final durationSeconds = duration.inMilliseconds / 1000.0;
-
-    // Create different patterns based on file type and duration
-    final isShort = durationSeconds < 5.0;
-    final isLong = durationSeconds > 30.0;
-    final fileType = fileName.split('.').last.toLowerCase();
-
-    for (int i = 0; i < dataPoints; i++) {
-      final progress = i / dataPoints.toDouble();
-
-      // Base amplitude varies by file type and duration
-      double baseAmplitude = 0.2;
-
-      if (isShort) {
-        // Short files have more dynamic patterns
-        baseAmplitude = 0.4 + 0.3 * (progress * 2 - 1).abs();
-      } else if (isLong) {
-        // Long files have more gradual patterns
-        baseAmplitude = 0.3 + 0.2 * (progress * 2 - 1).abs();
-      } else {
-        // Medium files have balanced patterns
-        baseAmplitude = 0.35 + 0.25 * (progress * 2 - 1).abs();
-      }
-
-      // Add file-specific variations
-      final hashVariation = (fileNameHash % 1000) / 1000.0;
-      final durationVariation = (durationSeconds % 10) / 10.0;
-
-      // Create realistic wave patterns
-      final wave1 = (progress * 2 + hashVariation) % 1.0;
-      final wave2 = (progress * 3 + durationVariation) % 1.0;
-      final wave3 = (progress * 5 + (fileNameHash % 100) / 100.0) % 1.0;
-
-      // Combine patterns for realistic waveform
-      final amplitude = baseAmplitude + 0.15 * wave1 + 0.1 * wave2 + 0.05 * wave3;
-
-      // Add some randomness for realism
-      final random = (fileNameHash + i) % 100 / 100.0;
-      final finalAmplitude = amplitude + (random - 0.5) * 0.1;
-
-      // Convert to [-1, 1] range for proper mirrored display
-      final mirroredAmplitude = (finalAmplitude.clamp(0.0, 1.0) * 2 - 1);
-      waveformData.add(mirroredAmplitude);
-    }
-
-    return waveformData;
+  // Waveform debug suppressed
   }
 
   /// Generate a unique waveform pattern based on audio file properties
   List<double> _generateUniqueWaveform(String filePath) {
     final List<double> waveformData = [];
-    final int dataPoints = 100;
+    const int dataPoints = 100;
 
     // Use file name hash to create unique patterns
     final fileName = filePath.split('/').last;
@@ -579,22 +850,7 @@ class AudioProvider with ChangeNotifier {
     return waveformData;
   }
 
-  /// Generate fallback waveform data when audio analysis fails
-  List<double> _generateFallbackWaveform() {
-    final List<double> waveformData = [];
-    for (int i = 0; i < 100; i++) {
-      // Create a simple wave pattern using modulo and basic arithmetic
-      final wave1 = (i % 20) / 20.0;
-      final wave2 = (i % 15) / 15.0;
-      final wave3 = (i % 25) / 25.0;
-      final amplitude = 0.3 + 0.4 * wave1 + 0.2 * wave2 + 0.1 * wave3;
-      
-      // Convert to [-1, 1] range for proper mirrored display
-      final mirroredAmplitude = (amplitude.clamp(0.0, 1.0) * 2 - 1);
-      waveformData.add(mirroredAmplitude);
-    }
-    return waveformData;
-  }
+  // Fallback helper removed; use _generateUniqueWaveform for all synthetic cases
 
   double get playbackProgress {
     if (_duration.inMilliseconds == 0) return 0.0;
@@ -603,7 +859,43 @@ class AudioProvider with ChangeNotifier {
 
   @override
   void dispose() {
-    _player.dispose();
+    // Cancel subscriptions to avoid leaks and satisfy lints
+    try {
+      _positionSubscription?.cancel();
+    } catch (_) {}
+    try {
+      _durationSubscription?.cancel();
+    } catch (_) {}
+    try {
+      _playerStateSubscription?.cancel();
+    } catch (_) {}
+    _positionSubscription = null;
+    _durationSubscription = null;
+    _playerStateSubscription = null;
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    _smoothPlayheadTimer?.cancel();
+    _smoothPlayheadTimer = null;
+  _trimDebounce?.cancel();
+  _trimDebounce = null;
+    // Deactivate audio session if we had activated it
+    () async {
+      try {
+        if (_sessionActive) {
+          final session = await AudioSession.instance;
+          await session.setActive(false);
+          _sessionActive = false;
+        }
+      } catch (_) {}
+    }();
+  _engine?.dispose();
+  _dspGraph?.dispose();
     super.dispose();
   }
 } 
+
+
+
+
+
+

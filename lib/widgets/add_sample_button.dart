@@ -84,7 +84,7 @@ class _AddSampleButtonState extends State<AddSampleButton>
                     ),
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.black.withOpacity(0.1),
+                        color: Colors.black.withValues(alpha: 0.1),
                         blurRadius: 4,
                         offset: const Offset(0, 2),
                       ),
@@ -118,7 +118,7 @@ class _AddSampleButtonState extends State<AddSampleButton>
                       Text(
                         'Tap to import',
                         style: TextStyle(
-                          color: _getTextColor().withOpacity(0.6),
+                          color: _getTextColor().withValues(alpha: 0.6),
                           fontSize: 10,
                         ),
                         textAlign: TextAlign.center,
@@ -136,17 +136,17 @@ class _AddSampleButtonState extends State<AddSampleButton>
 
   Color _getButtonColor() {
     if (_isHovered) {
-      return Theme.of(context).colorScheme.primary.withOpacity(0.1);
+  return Theme.of(context).colorScheme.primary.withValues(alpha: 0.1);
     } else {
-      return Theme.of(context).colorScheme.surface.withOpacity(0.5);
+  return Theme.of(context).colorScheme.surface.withValues(alpha: 0.5);
     }
   }
 
   Color _getBorderColor() {
     if (_isHovered) {
-      return Theme.of(context).colorScheme.primary.withOpacity(0.5);
+  return Theme.of(context).colorScheme.primary.withValues(alpha: 0.5);
     } else {
-      return Theme.of(context).colorScheme.outline.withOpacity(0.2);
+  return Theme.of(context).colorScheme.outline.withValues(alpha: 0.2);
     }
   }
 
@@ -154,7 +154,7 @@ class _AddSampleButtonState extends State<AddSampleButton>
     if (_isHovered) {
       return Theme.of(context).colorScheme.primary;
     } else {
-      return Theme.of(context).colorScheme.onSurface.withOpacity(0.5);
+  return Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.5);
     }
   }
 
@@ -162,7 +162,7 @@ class _AddSampleButtonState extends State<AddSampleButton>
     if (_isHovered) {
       return Theme.of(context).colorScheme.primary;
     } else {
-      return Theme.of(context).colorScheme.onSurface.withOpacity(0.7);
+  return Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.7);
     }
   }
 } 

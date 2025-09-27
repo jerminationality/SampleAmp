@@ -25,6 +25,17 @@ class SoLoudFfiEngine implements AudioEngine {
   double get debugSpeed => _speed;
   double get debugVolume => _volume;
   dynamic get debugGraph => _dspGraph;
+  int? _backendId;
+  String? _backendName;
+  int? _backendSamplerate;
+  int? _backendBufferSize;
+  int? _backendChannels;
+
+  int? get debugBackendId => _backendId;
+  String? get debugBackendName => _backendName;
+  int? get debugBackendSamplerate => _backendSamplerate;
+  int? get debugBackendBufferSize => _backendBufferSize;
+  int? get debugBackendChannels => _backendChannels;
 
   @override
   bool get supportsDsp => true; // Native mixer will allow future DSP integration
@@ -43,29 +54,49 @@ class SoLoudFfiEngine implements AudioEngine {
   @override
   Future<void> init() async {
     if (_initialized) return;
-    if (!SoLoudFfi.instance.isLoaded) {
-      final err = SoLoudFfi.instance.loadError;
-      throw StateError(err == null
-          ? 'SoLoud native bindings unavailable'
-          : 'SoLoud native bindings unavailable: $err');
-    }
     try {
+      if (kDebugMode) {
+        // ignore: avoid_print
+        print('[SoLoudFfiEngine] attempting native init');
+      }
       final ptr = SoLoudFfi.instance.create();
       if (ptr == ffi.nullptr) {
         throw StateError('SoLoud native create returned null');
       }
       _soloud = ptr;
+      _backendId = SoLoudFfi.instance.backendId(ptr);
+      final backendPtr = SoLoudFfi.instance.backendString(ptr);
+      _backendName = backendPtr == ffi.nullptr ? null : backendPtr.cast<Utf8>().toDartString();
+      _backendSamplerate = SoLoudFfi.instance.backendSamplerate(ptr);
+      _backendBufferSize = SoLoudFfi.instance.backendBufferSize(ptr);
+      _backendChannels = SoLoudFfi.instance.backendChannels(ptr);
       _initialized = true;
-    } catch (e) {
-      // If dynamic lib missing, rethrow so factory can fallback
+      if (kDebugMode) {
+        // ignore: avoid_print
+        print('[SoLoudFfiEngine] init ok backend=${_backendName ?? 'unknown'} (id=${_backendId ?? -1}) sr=${_backendSamplerate ?? 0} buf=${_backendBufferSize ?? 0} ch=${_backendChannels ?? 0}');
+      }
+    } catch (e, stack) {
+      _soloud = null;
+      _backendId = null;
+      _backendName = null;
+      _backendSamplerate = null;
+      _backendBufferSize = null;
+      _backendChannels = null;
+      _initialized = false;
+      if (kDebugMode) {
+        // ignore: avoid_print
+        print('[SoLoudFfiEngine] init failed: $e');
+        // ignore: avoid_print
+        print(stack);
+      }
       throw StateError('SoLoud FFI init failed: $e');
     }
-  }
 
+  }
   @override
   Future<void> dispose() async {
     try {
-      if (_soloud != null && SoLoudFfi.instance.isLoaded) {
+      if (_soloud != null) {
         SoLoudFfi.instance.destroy(_soloud!);
       }
     } finally {
@@ -73,6 +104,11 @@ class SoLoudFfiEngine implements AudioEngine {
       _currentHandle = null;
       _initialized = false;
       _playing = false;
+      _backendId = null;
+      _backendName = null;
+      _backendSamplerate = null;
+      _backendBufferSize = null;
+      _backendChannels = null;
     }
   }
 
@@ -126,12 +162,12 @@ class SoLoudFfiEngine implements AudioEngine {
 
   @override
   Future<void> stop() async {
-    if (_currentHandle != null) {
+    if (_currentHandle != null && _playing) {
       final engine = _requireEngine();
       SoLoudFfi.instance.stop(engine, _currentHandle!);
-      _playing = false;
-      _position = Duration.zero;
     }
+    _playing = false;
+    _position = Duration.zero;
   }
 
   @override

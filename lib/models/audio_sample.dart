@@ -1,4 +1,3 @@
-import 'dart:io';
 import 'dart:math';
 
 class AudioSample {
@@ -20,6 +19,7 @@ class AudioSample {
   final bool isBlank;
   final int? customColor;
   final List<double>? waveformData;
+  final bool isWaveformLoading;
   final double gainDb;
 
   AudioSample({
@@ -41,6 +41,7 @@ class AudioSample {
     this.isBlank = false,
     this.customColor,
     this.waveformData,
+    this.isWaveformLoading = false,
     this.gainDb = 0.0,
   });
 
@@ -63,6 +64,7 @@ class AudioSample {
     bool? isBlank,
     int? customColor,
     List<double>? waveformData,
+    bool? isWaveformLoading,
     double? gainDb,
   }) {
     return AudioSample(
@@ -84,6 +86,7 @@ class AudioSample {
       isBlank: isBlank ?? this.isBlank,
       customColor: customColor ?? this.customColor,
       waveformData: waveformData ?? this.waveformData,
+      isWaveformLoading: isWaveformLoading ?? this.isWaveformLoading,
       gainDb: gainDb ?? this.gainDb,
     );
   }
@@ -108,6 +111,7 @@ class AudioSample {
       'isBlank': isBlank,
       'customColor': customColor,
       'waveformData': waveformData,
+      'isWaveformLoading': isWaveformLoading,
       'gainDb': gainDb,
     };
   }
@@ -131,9 +135,10 @@ class AudioSample {
       notes: json['notes'],
       isBlank: json['isBlank'] ?? false,
       customColor: json['customColor'],
-      waveformData: json['waveformData'] != null 
+      waveformData: json['waveformData'] != null
           ? List<double>.from(json['waveformData'])
           : null,
+      isWaveformLoading: json['isWaveformLoading'] ?? false,
       gainDb: json['gainDb']?.toDouble() ?? 0.0,
     );
   }
@@ -148,10 +153,10 @@ class AudioSample {
   bool get isTrimmed => startTime > Duration.zero || (endTime > Duration.zero && endTime < duration);
 
   double get amplitude => pow(10.0, gainDb / 20.0).toDouble();
-  
+
   /// Debug method to print gain information
   void debugGain() {
     final amp = amplitude;
-    print('[AudioSample] Gain: ${gainDb.toStringAsFixed(1)} dB → Amplitude: ${amp.toStringAsFixed(6)}');
+    print('[AudioSample] Gain: ${gainDb.toStringAsFixed(1)} dB -> Amplitude: ${amp.toStringAsFixed(6)}');
   }
-} 
+}

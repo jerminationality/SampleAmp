@@ -26,6 +26,8 @@ typedef _seek_native = ffi.Void Function(ffi.Pointer<ffi.Void>, ffi.Int32, ffi.D
 typedef _pos_native = ffi.Double Function(ffi.Pointer<ffi.Void>, ffi.Int32);
 typedef _clip_native = ffi.Void Function(ffi.Pointer<ffi.Void>, ffi.Int32, ffi.Double, ffi.Double);
 typedef _set_speed_native = ffi.Void Function(ffi.Pointer<ffi.Void>, ffi.Int32, ffi.Float);
+typedef _backend_query_native = ffi.Uint32 Function(ffi.Pointer<ffi.Void>);
+typedef _backend_string_native = ffi.Pointer<ffi.Int8> Function(ffi.Pointer<ffi.Void>);
 
 // Dart types
 typedef _destroy = void Function(ffi.Pointer<ffi.Void>);
@@ -39,12 +41,13 @@ typedef _seek = void Function(ffi.Pointer<ffi.Void>, int, double);
 typedef _pos = double Function(ffi.Pointer<ffi.Void>, int);
 typedef _clip = void Function(ffi.Pointer<ffi.Void>, int, double, double);
 typedef _set_speed = void Function(ffi.Pointer<ffi.Void>, int, double);
+typedef _backend_query = int Function(ffi.Pointer<ffi.Void>);
+typedef _backend_string = ffi.Pointer<ffi.Int8> Function(ffi.Pointer<ffi.Void>);
 
 class SoLoudFfi {
   SoLoudFfi._() {
     try {
       final lib = _openLib();
-      _lib = lib;
       _createNative = lib.lookupFunction<_create_native, _create_native>('soloud_flutter_create');
       _destroyNative = lib.lookupFunction<_destroy_native, _destroy>('soloud_flutter_destroy');
       _loadNative = lib.lookupFunction<_load_native, _load>('soloud_flutter_load');
@@ -58,7 +61,13 @@ class SoLoudFfi {
       _durationNative = lib.lookupFunction<_pos_native, _pos>('soloud_flutter_duration');
       _setClipNative = lib.lookupFunction<_clip_native, _clip>('soloud_flutter_set_clip');
       _setSpeedNative = lib.lookupFunction<_set_speed_native, _set_speed>('soloud_flutter_set_speed');
-    } catch (error, _) {
+      _backendIdNative = lib.lookupFunction<_backend_query_native, _backend_query>('soloud_flutter_backend_id');
+      _backendStringNative = lib.lookupFunction<_backend_string_native, _backend_string>('soloud_flutter_backend_string');
+      _backendSamplerateNative = lib.lookupFunction<_backend_query_native, _backend_query>('soloud_flutter_backend_samplerate');
+      _backendBufferSizeNative = lib.lookupFunction<_backend_query_native, _backend_query>('soloud_flutter_backend_buffer_size');
+      _backendChannelsNative = lib.lookupFunction<_backend_query_native, _backend_query>('soloud_flutter_backend_channels');
+      _lib = lib;
+    } catch (error) {
       _loadError = error;
       _lib = null;
     }
@@ -82,14 +91,19 @@ class SoLoudFfi {
   late final _pos _durationNative;
   late final _clip _setClipNative;
   late final _set_speed _setSpeedNative;
+  late final _backend_query _backendIdNative;
+  late final _backend_string _backendStringNative;
+  late final _backend_query _backendSamplerateNative;
+  late final _backend_query _backendBufferSizeNative;
+  late final _backend_query _backendChannelsNative;
 
   bool get isLoaded => _lib != null;
   Object? get loadError => _loadError;
 
   void _ensureLoaded() {
     if (_lib == null) {
-      final details = _loadError == null ? '' : ' (${_loadError})';
-      throw StateError('SoLoud native library unavailable$details');
+      final details = _loadError == null ? '' : ' (' + _loadError.toString() + ')';
+      throw StateError('SoLoud native library unavailable' + details);
     }
   }
 
@@ -159,5 +173,30 @@ class SoLoudFfi {
   void setSpeed(ffi.Pointer<ffi.Void> engine, int handle, double speed) {
     _ensureLoaded();
     _setSpeedNative(engine, handle, speed);
+  }
+
+  int backendId(ffi.Pointer<ffi.Void> engine) {
+    _ensureLoaded();
+    return _backendIdNative(engine);
+  }
+
+  ffi.Pointer<ffi.Int8> backendString(ffi.Pointer<ffi.Void> engine) {
+    _ensureLoaded();
+    return _backendStringNative(engine);
+  }
+
+  int backendSamplerate(ffi.Pointer<ffi.Void> engine) {
+    _ensureLoaded();
+    return _backendSamplerateNative(engine);
+  }
+
+  int backendBufferSize(ffi.Pointer<ffi.Void> engine) {
+    _ensureLoaded();
+    return _backendBufferSizeNative(engine);
+  }
+
+  int backendChannels(ffi.Pointer<ffi.Void> engine) {
+    _ensureLoaded();
+    return _backendChannelsNative(engine);
   }
 }

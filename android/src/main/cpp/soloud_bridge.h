@@ -24,6 +24,12 @@ void  soloud_flutter_set_clip(void* engine, int handle, double startSec, double 
 // Set relative playback speed for a voice (1.0 = normal)
 void  soloud_flutter_set_speed(void* engine, int handle, float speed);
 
+unsigned int soloud_flutter_backend_id(void* engine);
+const char* soloud_flutter_backend_string(void* engine);
+unsigned int soloud_flutter_backend_samplerate(void* engine);
+unsigned int soloud_flutter_backend_buffer_size(void* engine);
+unsigned int soloud_flutter_backend_channels(void* engine);
+
 #ifdef __cplusplus
 }
 #endif

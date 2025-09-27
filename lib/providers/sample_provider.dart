@@ -268,6 +268,49 @@ class SampleProvider with ChangeNotifier {
     
   }
 
+  Future<AudioSample> addSampleShell({
+    required String name,
+    required String category,
+    required String filePath,
+    required Duration duration,
+    String? notes,
+  }) async {
+    final now = DateTime.now();
+    final sample = AudioSample(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      name: name,
+      filePath: filePath,
+      duration: duration,
+      category: category,
+      notes: notes,
+      createdAt: now,
+      lastModified: now,
+      isBlank: false,
+      waveformData: null,
+      isWaveformLoading: true,
+    );
+    await addSample(sample);
+    return sample;
+  }
+
+  Future<void> setSampleWaveform(String sampleId, List<double> waveformData) async {
+    for (final page in _availablePages) {
+      final pageSamples = _pageSamples[page] ?? [];
+      final index = pageSamples.indexWhere((s) => s.id == sampleId);
+      if (index != -1) {
+        pageSamples[index] = pageSamples[index].copyWith(
+          waveformData: waveformData,
+          isWaveformLoading: false,
+          lastModified: DateTime.now(),
+        );
+        await _saveSamples();
+        _applyFilters();
+        notifyListeners();
+        return;
+      }
+    }
+  }
+
   Future<void> addSample(AudioSample sample) async {
     final currentPageLetter = _availablePages[_currentPage];
     if (!_pageSamples.containsKey(currentPageLetter)) {
@@ -478,4 +521,5 @@ class SampleProvider with ChangeNotifier {
       // Handle error silently
     }
   }
-} 
+}
+

@@ -1,0 +1,19 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "analyze (flutter)",
+			"type": "shell",
+			"command": "flutter analyze",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "analyze (flutter)",
+			"type": "shell",
+			"command": "flutter analyze",
+			"isBackground": false,
+			"group": "build"
+		}
+	]
+}

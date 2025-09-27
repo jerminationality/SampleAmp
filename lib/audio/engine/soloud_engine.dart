@@ -4,7 +4,7 @@ import 'package:live_audio_sampler/audio/engine/engine_types.dart';
 /// Minimal SoLoud FFI scaffold. Functions are placeholders until native libs are added.
 class SoLoudEngine implements AudioEngine {
   @override
-  bool get needsStartupRamp => false;
+  bool get needsStartupRamp => true;
   // Placeholder for future FFI lib; not required while delegating to just_audio
   bool _initialized = false;
   final ja.AudioPlayer _player = ja.AudioPlayer();

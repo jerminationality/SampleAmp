@@ -28,8 +28,26 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
 
+    externalNativeBuild {
+        cmake {
+            // Point to shared native source directory at android/src/main/cpp
+            path = file("../src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            keepDebugSymbols += setOf("**/libc++_shared.so")
+        }
+    }
     buildTypes {
         release {
             // TODO: Add your own signing config for the release build.
@@ -42,3 +60,4 @@ android {
 flutter {
     source = "../.."
 }
+

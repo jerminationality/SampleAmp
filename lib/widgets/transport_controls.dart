@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import '../providers/audio_provider.dart';
-import '../utils.dart';
+import 'package:live_audio_sampler/providers/audio_provider.dart';
+import 'package:live_audio_sampler/utils.dart';
 
 class TransportControls extends StatelessWidget {
   const TransportControls({super.key});
@@ -15,7 +15,7 @@ class TransportControls extends StatelessWidget {
         color: Theme.of(context).colorScheme.surface,
         borderRadius: BorderRadius.circular(12),
         border: Border.all(
-          color: Theme.of(context).colorScheme.outline.withOpacity(0.2),
+          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.2),
         ),
       ),
       child: Consumer<AudioProvider>(
@@ -93,7 +93,7 @@ class TransportControls extends StatelessWidget {
                       Icons.loop,
                       color: audioProvider.currentSample != null
                           ? Theme.of(context).colorScheme.primary
-                          : Theme.of(context).colorScheme.onSurface.withOpacity(0.3),
+                          : Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.3),
                     ),
                     tooltip: 'Loop',
                   ),
@@ -147,19 +147,21 @@ class TransportControls extends StatelessWidget {
               overlayRadius: 16,
             ),
             activeTrackColor: Theme.of(context).colorScheme.primary,
-            inactiveTrackColor: Theme.of(context).colorScheme.outline.withOpacity(0.3),
+            inactiveTrackColor: Theme.of(context).colorScheme.outline.withValues(alpha: 0.3),
             thumbColor: Theme.of(context).colorScheme.primary,
-            overlayColor: Theme.of(context).colorScheme.primary.withOpacity(0.2),
+            overlayColor: Theme.of(context).colorScheme.primary.withValues(alpha: 0.2),
           ),
           child: Slider(
             value: audioProvider.playbackProgress.clamp(0.0, 1.0),
             min: 0.0,
             max: 1.0,
             onChanged: (value) {
-              final newPosition = Duration(
-                milliseconds: (value * audioProvider.duration.inMilliseconds).round(),
-              );
-              audioProvider.seek(newPosition);
+              final current = audioProvider.currentSample;
+              if (current == null) return;
+              final full = audioProvider.duration.inMilliseconds;
+              final absoluteMs = (value * full).round();
+              final absolute = Duration(milliseconds: absoluteMs);
+              audioProvider.seek(absolute);
             },
           ),
         ),
@@ -189,7 +191,7 @@ class TransportControls extends StatelessWidget {
         Icon(
           Icons.access_time,
           size: 16,
-          color: Theme.of(context).colorScheme.onSurface.withOpacity(0.7),
+          color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.7),
         ),
         const SizedBox(width: 8),
         Text(

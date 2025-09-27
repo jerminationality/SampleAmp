@@ -1,21 +1,141 @@
+
 import 'dart:math';
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:flutter_staggered_grid_view/flutter_staggered_grid_view.dart';
-import 'package:flutter_colorpicker/flutter_colorpicker.dart';
+import 'package:flutter_staggered_grid_view/flutter_staggered_grid_view.dart'; // ignore: unused_import
+import 'package:flutter_colorpicker/flutter_colorpicker.dart'; // ignore: unused_import
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter_audio_waveforms/flutter_audio_waveforms.dart';
-import 'package:flutter_oknob/flutter_oldschool_knob.dart';
-import 'package:flutter_oknob/widgets/flutter_widget_painter.dart';
-import '../providers/audio_provider.dart';
-import '../providers/sample_provider.dart';
-import '../models/audio_sample.dart';
-import '../widgets/sample_grid.dart';
-import '../widgets/effects_panel.dart';
-import '../widgets/transport_controls.dart';
-import '../widgets/sample_button.dart';
-import '../utils.dart';
+import 'package:flutter_oknob/flutter_oldschool_knob.dart'; // ignore: unused_import
+import 'package:flutter_oknob/widgets/flutter_widget_painter.dart'; // ignore: unused_import
+import 'package:live_audio_sampler/providers/audio_provider.dart';
+import 'package:live_audio_sampler/providers/sample_provider.dart';
+import 'package:live_audio_sampler/models/audio_sample.dart';
+import 'package:live_audio_sampler/widgets/sample_grid.dart'; // ignore: unused_import
+import 'package:live_audio_sampler/widgets/effects_panel.dart'; // ignore: unused_import
+import 'package:live_audio_sampler/widgets/transport_controls.dart'; // ignore: unused_import
+import 'package:live_audio_sampler/widgets/sample_button.dart';
+import 'package:live_audio_sampler/utils.dart';
+
+// Painter to draw the chamfered trim region (fill + 1px yellow border)
+class _TrimRegionPainter extends CustomPainter {
+  final double startFrac; // 0..1
+  final double endFrac;   // 0..1
+  final Color fillColor;
+  final Color borderColor;
+  final double chamfer;      // not used in this variant; kept for API compatibility
+  final double borderWidth;  // in px
+
+  const _TrimRegionPainter({
+    required this.startFrac,
+    required this.endFrac,
+    required this.fillColor,
+    required this.borderColor,
+    this.chamfer = 8.0,
+    this.borderWidth = 1.0,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final width = size.width;
+    final height = size.height;
+    // Clamp to safe range
+    final double l = (startFrac.clamp(0.0, 1.0)) * width;
+    final double r = (endFrac.clamp(0.0, 1.0)) * width;
+    if (r <= l) return;
+
+    // Darken area OUTSIDE the trim window to emphasize the active (trimmed) region
+    final Paint dimPaint = Paint()
+      ..isAntiAlias = false
+      ..color = Colors.black.withValues(alpha: 0.45)
+      ..style = PaintingStyle.fill;
+    if (l > 0) {
+      canvas.drawRect(Rect.fromLTRB(0, 0, l, height), dimPaint);
+    }
+    if (r < width) {
+      canvas.drawRect(Rect.fromLTRB(r, 0, width, height), dimPaint);
+    }
+
+    // 1) Draw rectangular region (no cutouts)
+    final rect = Rect.fromLTRB(l, 0, r, height);
+    final fillPaint = Paint()
+      ..isAntiAlias = true
+      ..color = fillColor
+      ..style = PaintingStyle.fill;
+    canvas.drawRect(rect, fillPaint);
+
+    final strokePaint = Paint()
+      ..isAntiAlias = true
+      ..color = borderColor
+      ..strokeWidth = borderWidth
+      ..style = PaintingStyle.stroke;
+    canvas.drawRect(rect, strokePaint);
+
+    // 2) Draw fixed-size yellow triangle markers strictly clipped to the region rect
+    //    so nothing can render outside the yellow border.
+    final double mark = (height * 0.12).clamp(10.0, 14.0); // fixed proportionate size
+    final Paint markerFill = Paint()
+      ..isAntiAlias = true
+      ..color = borderColor
+      ..style = PaintingStyle.fill;
+    final Paint markerStroke = Paint()
+      ..isAntiAlias = true
+      ..color = borderColor
+      ..strokeWidth = borderWidth
+      ..style = PaintingStyle.stroke;
+
+    canvas.save();
+    canvas.clipRect(rect);
+
+    // Left-top triangle (inside the rect)
+    Path lt = Path()
+      ..moveTo(l + mark, 0)
+      ..lineTo(l, mark)
+      ..lineTo(l, 0)
+      ..close();
+    canvas.drawPath(lt, markerFill);
+    canvas.drawPath(lt, markerStroke);
+
+    // Left-bottom triangle
+    Path lb = Path()
+      ..moveTo(l + mark, height)
+      ..lineTo(l, height - mark)
+      ..lineTo(l, height)
+      ..close();
+    canvas.drawPath(lb, markerFill);
+    canvas.drawPath(lb, markerStroke);
+
+    // Right-top triangle
+    Path rt = Path()
+      ..moveTo(r - mark, 0)
+      ..lineTo(r, mark)
+      ..lineTo(r, 0)
+      ..close();
+    canvas.drawPath(rt, markerFill);
+    canvas.drawPath(rt, markerStroke);
+
+    // Right-bottom triangle
+    Path rb = Path()
+      ..moveTo(r - mark, height)
+      ..lineTo(r, height - mark)
+      ..lineTo(r, height)
+      ..close();
+    canvas.drawPath(rb, markerFill);
+    canvas.drawPath(rb, markerStroke);
+
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(covariant _TrimRegionPainter oldDelegate) {
+    return startFrac != oldDelegate.startFrac ||
+        endFrac != oldDelegate.endFrac ||
+        fillColor != oldDelegate.fillColor ||
+        borderColor != oldDelegate.borderColor ||
+        chamfer != oldDelegate.chamfer ||
+        borderWidth != oldDelegate.borderWidth;
+  }
+}
 
 
 class MainSamplerScreen extends StatefulWidget {
@@ -34,33 +154,59 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
   double? _draggingTrimEnd;
   Offset? _dragTooltipPosition;
   String? _dragTooltipText;
+  // Time-display tooltip state (kept for now; may be removed if tap-only without tooltip)
+  Offset? _timeTooltipPosition;
+  String? _timeTooltipText;
   static const double _minTrimFraction = 0.02;
   double? _playheadPosition; // 0.0-1.0 relative to waveform
   bool _playheadLockedToStart = true;
   Duration? _draggingTrimStartTime;
   Duration? _draggingTrimEndTime;
+  // Removed time display drag tooltip state (tap-to-seek only)
+  // Track drag bases and accumulated deltas so handle follows finger precisely
+  double _dragStartBasePxStart = 0.0;
+  double _dragAccumDxStart = 0.0;
+  double _dragStartBasePxEnd = 0.0;
+  double _dragAccumDxEnd = 0.0;
+  // Whether the user explicitly sought in the time window; governs playhead visibility when not playing
+  bool _userHasSought = false;
+  // Keys to unify playhead rendering across time bar and waveform area
+  final GlobalKey _panelStackKey = GlobalKey();
+  final GlobalKey _timeBarKey = GlobalKey();
+  final GlobalKey _waveformKey = GlobalKey();
+
+  Rect? _rectFor(GlobalKey childKey, GlobalKey ancestorKey) {
+    final ctx = childKey.currentContext;
+    final anc = ancestorKey.currentContext;
+    if (ctx == null || anc == null) return null;
+    final box = ctx.findRenderObject() as RenderBox?;
+    final ancBox = anc.findRenderObject() as RenderBox?;
+    if (box == null || ancBox == null || !box.hasSize || !ancBox.hasSize) return null;
+    final topLeft = box.localToGlobal(Offset.zero, ancestor: ancBox);
+    return topLeft & box.size;
+  }
+
+  // Cache provider refs for safe listener removal in dispose
+  AudioProvider? _audioProviderRef;
+  SampleProvider? _sampleProviderRef;
 
   @override
   void initState() {
     super.initState();
-    // Add listener to check if selected sample still exists
+    // Add listeners after first frame and cache provider refs
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      final sampleProvider = Provider.of<SampleProvider>(context, listen: false);
-      sampleProvider.addListener(_checkSelectedSampleExists);
-    });
-    // Listen to AudioProvider's playback state
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final audioProvider = Provider.of<AudioProvider>(context, listen: false);
-      audioProvider.addListener(_handleAudioProviderUpdate);
+      _sampleProviderRef = Provider.of<SampleProvider>(context, listen: false);
+      _sampleProviderRef!.addListener(_checkSelectedSampleExists);
+
+      _audioProviderRef = Provider.of<AudioProvider>(context, listen: false);
+      _audioProviderRef!.addListener(_handleAudioProviderUpdate);
     });
   }
 
   @override
   void dispose() {
-    final audioProvider = Provider.of<AudioProvider>(context, listen: false);
-    audioProvider.removeListener(_handleAudioProviderUpdate);
-    final sampleProvider = Provider.of<SampleProvider>(context, listen: false);
-    sampleProvider.removeListener(_checkSelectedSampleExists);
+    _audioProviderRef?.removeListener(_handleAudioProviderUpdate);
+    _sampleProviderRef?.removeListener(_checkSelectedSampleExists);
     super.dispose();
   }
 
@@ -73,6 +219,14 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
         setState(() {
           _selectedSample = null;
         });
+      } else {
+        // Keep local selected sample fresh so UI reflects async updates (e.g., waveform loading)
+        final updated = sampleProvider.getSampleById(_selectedSample!.id);
+        if (updated != null && updated != _selectedSample) {
+          setState(() {
+            _selectedSample = updated;
+          });
+        }
       }
     }
   }
@@ -81,7 +235,6 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
     final audioProvider = Provider.of<AudioProvider>(context, listen: false);
     final sample = _selectedSample;
     if (sample == null) return;
-    
     if (audioProvider.isPlaying) {
       // Unlock playhead to follow playback
       if (_playheadLockedToStart) {
@@ -96,117 +249,29 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
           _playheadLockedToStart = true;
         });
       }
+      // If engine is at the beginning, treat as defaulted state → hide playhead until user seeks
+      // This covers initialization and post-finish reset.
+      if (audioProvider.position.inMilliseconds <= 0) {
+        setState(() {
+          _playheadPosition = null;
+          _userHasSought = false;
+        });
+      }
     }
-    
-    // Trigger rebuild to update playhead position
+    // Trigger a repaint so time bars/playhead update
     setState(() {});
   }
 
-  // Compute the gain fader slider position (0.0 - 1.0) using the same mapping as _GainFader
-  double _gainSliderPositionForSample(AudioSample sample) {
-    const double minDb = _GainFader.minDb;
-    const double maxDb = _GainFader.maxDb;
-    const double centerDb = _GainFader.centerDb;
-    if (sample.gainDb <= centerDb) {
-      return (0.5 * ((sample.gainDb - minDb) / (centerDb - minDb))).clamp(0.0, 1.0);
-    } else {
-      return (0.5 + 0.5 * ((sample.gainDb - centerDb) / (maxDb - centerDb))).clamp(0.0, 1.0);
-    }
-  }
-
-  // Scale waveform samples for visual display based on gain slider position.
-  // - At sliderPos == 0.0 → scale to 0 (flat line)
-  // - At sliderPos == 0.5 (0 dB) → original samples (no change)
-  // - Above 0.5 → scale up using amplitude factor from dB and clamp to [-1, 1]
-  List<double> _scaledWaveformSamplesForDisplay(AudioSample sample) {
-    final data = sample.waveformData;
-    if (data == null || data.isEmpty) return const [];
-    final sliderPos = _gainSliderPositionForSample(sample);
-    if (sliderPos <= 0.0) {
-      return List<double>.filled(data.length, 0.0);
-    }
-    if (sliderPos < 0.5) {
-      final scaleDown = (2.0 * sliderPos).clamp(0.0, 1.0);
-      return data.map((v) => (v * scaleDown)).toList(growable: false);
-    }
-    // sliderPos >= 0.5 → positive or zero gain
-    if (sample.gainDb <= 0.0) {
-      // Exactly 0 dB case or slight negatives rounded: keep original
-      return List<double>.from(data, growable: false);
-    }
-    // Compute amplitude factor from dB boost
-    final double amplitude = pow(10.0, sample.gainDb / 20.0).toDouble();
-    // Soft saturation to avoid hard flat-tops while staying within [-1, 1]
-    const double knee = 1.5; // larger = softer knee
-    double _softClip(double x) => x / (1.0 + knee * x.abs());
-    return data
-        .map((v) => _softClip(v * amplitude))
-        .toList(growable: false);
-  }
-
-  Future<void> _promptSetGainDb(BuildContext context) async {
-    if (_selectedSample == null) return;
-    final sampleProvider = Provider.of<SampleProvider>(context, listen: false);
-    final audioProvider = Provider.of<AudioProvider>(context, listen: false);
-    final TextEditingController controller = TextEditingController(
-      text: _selectedSample!.gainDb.toStringAsFixed(1),
-    );
-
-    final result = await showDialog<double>(
-      context: context,
-      builder: (ctx) {
-        return AlertDialog(
-          title: const Text('Set Gain (dB)'),
-          content: TextField(
-            controller: controller,
-            autofocus: true,
-            keyboardType: const TextInputType.numberWithOptions(signed: true, decimal: true),
-            decoration: const InputDecoration(
-              hintText: 'e.g. -6.0 or 3.0',
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('Cancel'),
-            ),
-            TextButton(
-              onPressed: () {
-                final parsed = double.tryParse(controller.text.trim());
-                if (parsed == null) {
-                  Navigator.of(ctx).pop();
-                  return;
-                }
-                // Clamp to fader bounds
-                const double minDb = _GainFader.minDb;
-                const double maxDb = _GainFader.maxDb;
-                final double clamped = parsed.clamp(minDb, maxDb);
-                Navigator.of(ctx).pop(clamped);
-              },
-              child: const Text('Set'),
-            ),
-          ],
-        );
-      },
-    );
-
-    if (result != null) {
-      final updated = _selectedSample!.copyWith(gainDb: result);
-      sampleProvider.updateSample(updated);
-      await audioProvider.updateSampleGain(updated);
-      setState(() => _selectedSample = updated);
-    }
-  }
+  // Quick helper: convert semitones <-> pitch
+  double _semitonesToPitch(double semitones) => pow(2.0, semitones / 12.0).toDouble();
+  double _pitchToSemitones(double pitch) => 12.0 * log(pitch) / log(2.0);
 
   Future<void> _promptSetPitchSemitones(BuildContext context) async {
     if (_selectedSample == null) return;
     final sampleProvider = Provider.of<SampleProvider>(context, listen: false);
     final audioProvider = Provider.of<AudioProvider>(context, listen: false);
-
-    double _pitchToSemitones(double pitch) => 12.0 * log(pitch) / log(2.0);
-    double _semitonesToPitch(double semitones) => pow(2.0, semitones / 12.0).toDouble();
-
     final currentSemitones = _pitchToSemitones(_selectedSample!.pitch);
+
     final TextEditingController controller = TextEditingController(
       text: currentSemitones.toStringAsFixed(1),
     );
@@ -257,12 +322,64 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
     }
   }
 
+  // ---- Gain helpers ----
+  // Gain bounds used by the gain dialog
+  static const double _gainMinDb = -48.0;
+  static const double _gainMaxDb = 12.0;
+
+  // Removed unused _gainSliderPositionForSample helper.
+
+  // removed unused _scaledWaveformSamplesForDisplay
+
+  Future<void> _promptSetGainDb(BuildContext context) async {
+    if (_selectedSample == null) return;
+    final sampleProvider = Provider.of<SampleProvider>(context, listen: false);
+    final audioProvider = Provider.of<AudioProvider>(context, listen: false);
+    final controller = TextEditingController(text: _selectedSample!.gainDb.toStringAsFixed(1));
+
+    final result = await showDialog<double>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text('Set Gain (dB)'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            keyboardType: const TextInputType.numberWithOptions(signed: true, decimal: true),
+            decoration: const InputDecoration(hintText: 'Range: -48.0 to +12.0 dB'),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
+            TextButton(
+              onPressed: () {
+                final parsed = double.tryParse(controller.text.trim());
+                if (parsed == null) {
+                  Navigator.of(ctx).pop();
+                  return;
+                }
+                final clamped = parsed.clamp(_gainMinDb, _gainMaxDb);
+                Navigator.of(ctx).pop(clamped);
+              },
+              child: const Text('Set'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (result != null) {
+      final updated = _selectedSample!.copyWith(gainDb: result);
+      sampleProvider.updateSample(updated);
+      await audioProvider.updateSampleGain(updated);
+      setState(() => _selectedSample = updated);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    final hasSelectedSample = _selectedSample != null;
     return Scaffold(
       resizeToAvoidBottomInset: false,
-      backgroundColor: Theme.of(context).colorScheme.background,
+  backgroundColor: Theme.of(context).colorScheme.surface,
       body: Padding(
         padding: const EdgeInsets.fromLTRB(16, 24, 16, 16), // Extra top margin for status bar
         child: Column(
@@ -274,14 +391,11 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
             Expanded(
               child: Row(
                 children: [
-                  // Left Panel - Sample Grid (6x4)
                   Expanded(
                     flex: 2,
                     child: _buildLeftPanel(),
                   ),
-                  // Space between left and right panels
                   const SizedBox(width: 4),
-                  // Right Panel - Sample Details
                   Expanded(
                     flex: 1,
                     child: _buildRightPanel(),
@@ -303,16 +417,17 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
             // Sample grid container with background
             Expanded(
               child: Container(
-          decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.surface.withOpacity(0.75),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surface.withValues(alpha: 0.75),
                   borderRadius: BorderRadius.circular(2),
-          ),
+                ),
+                // Inner grid handles its own padding; avoid extra padding here
                 child: _buildSampleGrid(),
               ),
             ),
             // Tab buttons at the very bottom (separate from grid background)
             Container(
-              padding: const EdgeInsets.only(top: 4, left: 8, right: 16, bottom: 0),
+              padding: const EdgeInsets.only(top: 0, left: 12, right: 12, bottom: 0),
                 child: Consumer<SampleProvider>(
                   builder: (context, sampleProvider, child) {
                     return Row(
@@ -344,54 +459,62 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
     return '$pageLetter${index + 1}';
   }
 
-  String _getDisplayTextForSample(AudioSample sample, int index) {
-    if (sample.isBlank) {
-      return 'Add Audio';
-    } else if (sample.name.isEmpty || sample.name.trim().isEmpty) {
-      return _getGridPosition(index);
-    } else {
-      return sample.name.length > 12 
-          ? '${sample.name.substring(0, 12)}...'
-          : sample.name;
-    }
-  }
+  // (removed) _getDisplayTextForSample was unused
 
   Widget _buildSampleGrid() {
-    // 6 columns x 4 rows = 24 slots
-    const int totalSlots = 24;
+  // Responsive grid: tablet default 6x4 (24), phone (any orientation) 6x2 (12)
+    final media = MediaQuery.of(context);
+    final bool isPhone = media.size.shortestSide < 600;
+  final int cols = isPhone ? 6 : 6;
+  final int rows = isPhone ? 2 : 4;
+    final int totalSlots = cols * rows;
     return LayoutBuilder(
       builder: (context, constraints) {
-        // Calculate button size to fit grid in panel
-        final double spacing = 6;
-        final double maxWidth = constraints.maxWidth.isFinite ? constraints.maxWidth : 0;
-        final double maxHeight = constraints.maxHeight.isFinite ? constraints.maxHeight : 0;
-        final double gridWidth = max(maxWidth - 24, 0);
-        final double gridHeight = max(maxHeight - 24, 0);
-        final double buttonWidth = max((gridWidth - (6 - 1) * spacing) / 6, 0);
-        final double buttonHeight = max(((gridHeight - (4 - 1) * spacing) / 4) - 6, 0);
-        final double childAspectRatio = (buttonWidth > 0 && buttonHeight > 0)
-            ? buttonWidth / buttonHeight
-            : 1.0;
+  // Calculate button size to fit grid in panel (uniform padding on all sides)
+  // Clamp to avoid negative sizes on very small layouts
+  final double spacingDefault = isPhone ? 4 : 6;
+  final double gridPadding = isPhone ? 8 : 12;
+  final double safeW = max(0.0, constraints.maxWidth);
+  final double safeH = max(0.0, constraints.maxHeight);
+  final double gridWidth = max(0.0, safeW - 2 * gridPadding);
+  final double gridHeight = max(0.0, safeH - 2 * gridPadding);
+  // Adapt spacing if the grid is very small to avoid negative tile sizes
+  final double spacingX = min(spacingDefault, (cols > 1) ? (gridWidth / (cols - 1 + 1e-6)) : spacingDefault);
+  final double spacingY = min(spacingDefault, (rows > 1) ? (gridHeight / (rows - 1 + 1e-6)) : spacingDefault);
+  final double buttonWidthNumerator = max(0.0, gridWidth - (cols - 1) * spacingX);
+  final double buttonHeightNumerator = max(0.0, gridHeight - (rows - 1) * spacingY);
+  final double buttonWidth = buttonWidthNumerator / cols;
+  // Remove extra height fudge to avoid unintended top gap; ensure rows fill available height
+  final double buttonHeight = buttonHeightNumerator / rows;
+  // Ensure a positive aspect ratio for grid tiles
+  final double safeButtonW = buttonWidth > 0 ? buttonWidth : 1.0;
+  final double safeButtonH = buttonHeight > 0 ? buttonHeight : 1.0;
+  final double childAspect = safeButtonW / safeButtonH;
         return Padding(
-          padding: const EdgeInsets.all(12),
+          padding: EdgeInsets.fromLTRB(gridPadding, gridPadding, gridPadding, gridPadding),
           child: Consumer<SampleProvider>(
             builder: (context, sampleProvider, child) {
               final samples = sampleProvider.currentPageSamples;
               return GridView.builder(
                 physics: const NeverScrollableScrollPhysics(),
+                padding: EdgeInsets.zero,
                 gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: 6,
-                  crossAxisSpacing: spacing,
-                  mainAxisSpacing: spacing,
-                  childAspectRatio: childAspectRatio,
+                  crossAxisCount: cols,
+      crossAxisSpacing: spacingX,
+      mainAxisSpacing: spacingY,
+      childAspectRatio: childAspect,
                 ),
                 itemCount: totalSlots,
                 itemBuilder: (context, index) {
                   if (index < samples.length) {
                     final sample = samples[index];
                     return DragTarget<AudioSample>(
-                      onWillAccept: (data) => data != null && data.id != sample.id,
-                      onAccept: (data) {
+                      onWillAcceptWithDetails: (details) {
+                        final data = details.data;
+                        return data.id != sample.id;
+                      },
+                      onAcceptWithDetails: (details) {
+                        final data = details.data;
                         final draggedIndex = samples.indexWhere((s) => s.id == data.id);
                         if (draggedIndex != -1 && draggedIndex != index) {
                           sampleProvider.reorderSamples(draggedIndex, index);
@@ -406,8 +529,8 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                           feedback: Material(
                             elevation: 8,
                             child: SizedBox(
-                              width: buttonWidth,
-                              height: buttonHeight,
+            width: max(0.0, buttonWidth),
+            height: max(0.0, buttonHeight),
                               child: SampleButton(
                                 sample: sample,
                                 gridPosition: _getGridPosition(index),
@@ -420,13 +543,13 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                             ),
                           ),
                           childWhenDragging: Container(
-                            width: buttonWidth,
-                            height: buttonHeight,
+          width: max(0.0, buttonWidth),
+          height: max(0.0, buttonHeight),
                             decoration: BoxDecoration(
-                              color: Colors.grey.withOpacity(0.3),
+                              color: Colors.grey.withValues(alpha: 0.3),
                               borderRadius: BorderRadius.circular(4),
                               border: Border.all(
-                                color: Colors.grey.withOpacity(0.5),
+                                color: Colors.grey.withValues(alpha: 0.5),
                                 width: 1,
                                 style: BorderStyle.solid,
                               ),
@@ -438,8 +561,8 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                             ),
                           ),
                           child: SizedBox(
-                            width: buttonWidth,
-                            height: buttonHeight,
+          width: max(0.0, buttonWidth),
+          height: max(0.0, buttonHeight),
                             child: SampleButton(
                               sample: sample,
                             gridPosition: _getGridPosition(index),
@@ -455,7 +578,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                     );
                   } else if (index == samples.length) {
                     // + button in the next available slot
-                    return _buildAddButton(width: buttonWidth, height: buttonHeight);
+        return _buildAddButton(width: max(0.0, buttonWidth), height: max(0.0, buttonHeight));
                   } else {
                     // Empty slot: invisible
                     return const SizedBox.shrink();
@@ -469,119 +592,9 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
     );
   }
 
-  Widget _buildSampleButton(AudioSample sample, bool isSelected, double width, double height, String gridPosition, {bool includeGestures = true}) {
-    return SizedBox(
-      width: width,
-      height: height,
-      child: SampleButton(
-        sample: sample,
-        gridPosition: gridPosition,
-        selectedSampleId: _selectedSample?.id,
-        onAddAudio: sample.isBlank ? () => _showAddSampleDialog(context, sampleId: sample.id) : null,
-        onSelect: () {
-            setState(() {
-              _selectedSample = sample;
-            });
-          },
-      ),
-        );
-  }
+  // (removed) _buildSampleButton was unused
 
-  Widget _buildDraggableSampleButton(AudioSample sample, bool isSelected, double width, double height, int index) {
-    // All samples (including blank ones) are draggable, tap, and long-press
-    Color feedbackColor;
-    if (sample.customColor != null) {
-      feedbackColor = Color(sample.customColor!);
-    } else if (sample.isBlank) {
-      feedbackColor = Colors.grey[600]!;
-    } else {
-      switch (sample.category.toLowerCase()) {
-        case 'applause':
-        case 'crowd':
-          feedbackColor = Colors.red;
-          break;
-        case 'music':
-        case 'background':
-          feedbackColor = Colors.green;
-          break;
-        default:
-          feedbackColor = Colors.white;
-      }
-    }
-    
-    return Draggable<AudioSample>(
-      data: sample,
-      onDragStarted: () {
-      },
-      onDragEnd: (details) {
-      },
-      feedback: Material(
-        elevation: 8,
-        child: Container(
-          width: width,
-          height: height,
-          decoration: BoxDecoration(
-            color: feedbackColor,
-            borderRadius: BorderRadius.circular(4),
-            border: Border.all(
-              color: Colors.yellow,
-              width: 2,
-            ),
-          ),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(
-                sample.isBlank ? Icons.add : Icons.graphic_eq,
-                color: Colors.white,
-                size: 24,
-              ),
-              const SizedBox(height: 4),
-              Text(
-                _getDisplayTextForSample(sample, index),
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 10,
-                  fontWeight: FontWeight.w500,
-                ),
-                textAlign: TextAlign.center,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ],
-          ),
-        ),
-      ),
-      childWhenDragging: Container(
-        width: width,
-        height: height,
-        decoration: BoxDecoration(
-          color: Colors.grey.withOpacity(0.3),
-          borderRadius: BorderRadius.circular(4),
-          border: Border.all(
-            color: Colors.grey.withOpacity(0.5),
-            width: 1,
-            style: BorderStyle.solid,
-          ),
-        ),
-        child: const Icon(
-          Icons.drag_indicator,
-          color: Colors.grey,
-          size: 24,
-        ),
-      ),
-      child: GestureDetector(
-        onTap: () {
-          if (sample.isBlank) {
-            _showAddSampleDialog(context, sampleId: sample.id);
-          } else {
-            _selectSample(sample);
-          }
-        },
-        child: _buildSampleButton(sample, isSelected, width, height, _getGridPosition(index), includeGestures: false),
-      ),
-    );
-  }
+  // (removed) _buildDraggableSampleButton was unused
 
   Widget _buildAddButton({double? width, double? height}) {
     return GestureDetector(
@@ -593,7 +606,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
         width: width,
         height: height,
         decoration: BoxDecoration(
-          color: Colors.grey[800]?.withOpacity(0.25),
+          color: (Colors.grey[800] ?? Colors.grey).withValues(alpha: 0.25),
           borderRadius: BorderRadius.circular(4),
         ),
         child: const Icon(
@@ -613,216 +626,192 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
       ),
       child: Column(
         children: [
-          // Sample title
-          Container(
-            padding: const EdgeInsets.all(16),
-            child: Consumer<SampleProvider>(
-              builder: (context, sampleProvider, child) {
-                final selectedSample = _selectedSample;
-                if (selectedSample != null) {
-                  // Replace the sample name Text with an editable TextField
-                  return _EditableSampleName(
-                    sample: selectedSample,
-                    onColorPicker: _showGridColorPicker,
+          // Top: sample label/color and playback buttons
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Label + color picker (full width)
+                Consumer<SampleProvider>(
+                  builder: (context, sampleProvider, child) {
+                    final selectedSample = _selectedSample;
+                    if (selectedSample != null) {
+                      return _EditableSampleName(
+                        sample: selectedSample,
+                        onColorPicker: _showGridColorPicker,
+                      );
+                    }
+                    // Disabled shell when nothing selected
+                    final disabledBgColor = Colors.grey[900];
+                    return Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: TextEditingController(text: ''),
+                            readOnly: true,
+                            maxLines: 1,
+                            textAlign: TextAlign.center,
+                            style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                                  color: Colors.grey[600],
+                                  fontWeight: FontWeight.w600,
+                                ),
+                            decoration: InputDecoration(
+                              isDense: true,
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                              filled: true,
+                              fillColor: disabledBgColor,
+                              border: const OutlineInputBorder(
+                                borderRadius: BorderRadius.only(
+                                  topLeft: Radius.circular(6),
+                                  bottomLeft: Radius.circular(6),
+                                  topRight: Radius.circular(0),
+                                  bottomRight: Radius.circular(0),
+                                ),
+                                borderSide: BorderSide.none,
+                              ),
+                              hintText: 'Sample Label',
+                              hintStyle: TextStyle(color: Colors.grey[700]),
+                            ),
+                            enabled: false,
+                          ),
+                        ),
+                        const SizedBox(width: 2),
+                        SizedBox(
+                          width: 48,
+                          height: 36,
+                          child: ElevatedButton(
+                            style: ElevatedButton.styleFrom(
+                              shape: const RoundedRectangleBorder(
+                                borderRadius: BorderRadius.only(
+                                  topLeft: Radius.circular(0),
+                                  bottomLeft: Radius.circular(0),
+                                  topRight: Radius.circular(6),
+                                  bottomRight: Radius.circular(6),
+                                ),
+                              ),
+                              padding: EdgeInsets.zero,
+                              backgroundColor: disabledBgColor,
+                              foregroundColor: Colors.grey[700],
+                              elevation: 0,
+                            ),
+                            onPressed: null,
+                            child: const Icon(Icons.palette, size: 20),
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+                const SizedBox(height: 8),
+                // Playback buttons row
+                Consumer<AudioProvider>(
+                  builder: (context, audioProvider, _) {
+                    final hasSelectedSample = _selectedSample != null;
+                    final isLoadingSel = hasSelectedSample && (_selectedSample!.isWaveformLoading);
+                    return Row(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: [
+                        _buildRectControlButton(
+                          Icons.first_page,
+                          'Rewind',
+                          onPressed: hasSelectedSample && !isLoadingSel
+                              ? () async {
+                                  audioProvider.seek(Duration.zero);
+                                  if (_selectedSample != null) {
+                                    final durationMs = _selectedSample!.duration.inMilliseconds > 0 ? _selectedSample!.duration.inMilliseconds : 1;
+                                    final startFrac = (_selectedSample!.startTime.inMilliseconds / durationMs).clamp(0.0, 1.0);
+                                    setState(() {
+                                      _playheadLockedToStart = true;
+                                      _playheadPosition = startFrac;
+                                    });
+                                  }
+                                }
+                              : null,
+                          enabled: hasSelectedSample && !isLoadingSel,
+                        ),
+                        const SizedBox(width: 2),
+                        _buildRectControlButton(
+                          Icons.play_arrow,
+                          'Play',
+                          onPressed: hasSelectedSample && !isLoadingSel
+                              ? () async {
+                                  final sel = _selectedSample;
+                                  if (sel != null) {
+                                    if (audioProvider.currentSample?.id == sel.id) {
+                                      await audioProvider.play();
+                                    } else {
+                                      await audioProvider.playSample(sel);
+                                    }
+                                    setState(() {
+                                      _playheadLockedToStart = false;
+                                    });
+                                  }
+                                }
+                              : null,
+                          enabled: hasSelectedSample && !isLoadingSel,
+                        ),
+                        const SizedBox(width: 2),
+                        _buildRectControlButton(
+                          Icons.pause,
+                          'Pause',
+                          onPressed: hasSelectedSample && !isLoadingSel
+                              ? () async {
+                                  await audioProvider.pause();
+                                }
+                              : null,
+                          enabled: hasSelectedSample && !isLoadingSel,
+                        ),
+                        const SizedBox(width: 2),
+                        _buildRectControlButton(
+                          Icons.stop,
+                          'Stop',
+                          onPressed: hasSelectedSample && !isLoadingSel
+                              ? () async {
+                                  await audioProvider.stop();
+                                  if (_selectedSample != null) {
+                                    final durationMs = _selectedSample!.duration.inMilliseconds > 0 ? _selectedSample!.duration.inMilliseconds : 1;
+                                    final startFrac = (_selectedSample!.startTime.inMilliseconds / durationMs).clamp(0.0, 1.0);
+                                    setState(() {
+                                      _playheadLockedToStart = true;
+                                      _playheadPosition = startFrac;
+                                    });
+                                  }
+                                }
+                              : null,
+                          enabled: hasSelectedSample && !isLoadingSel,
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+          
+          // Playback clock retained but hidden for now (kept for future use)
+          Offstage(
+            offstage: true,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Consumer<AudioProvider>(
+                builder: (context, audioProvider, _) {
+                  final sample = _selectedSample;
+                  final text = (sample == null)
+                      ? '00:00:00 / 00:00:00'
+                      : '${formatDuration(sample.startTime)} / ${formatDuration((sample.endTime > Duration.zero && sample.endTime < sample.duration) ? sample.endTime : sample.duration)}';
+                  return Text(
+                    text,
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      fontWeight: FontWeight.bold,
+                      color: Colors.grey[600],
+                    ),
                   );
-                }
-                // Show disabled label/color picker row when no sample is selected
-                final panelColor = Theme.of(context).colorScheme.surface;
-                final disabledBgColor = Colors.grey[900];
-                return Row(
-                  children: [
-                    // Disabled label text field
-                    Expanded(
-                      child: TextField(
-                        controller: TextEditingController(text: ''),
-                        readOnly: true,
-                        maxLines: 1,
-                        textAlign: TextAlign.center,
-                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                          color: Colors.grey[600],
-                          fontWeight: FontWeight.w600,
-                        ),
-                        decoration: InputDecoration(
-                          isDense: true,
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                          filled: true,
-                          fillColor: disabledBgColor,
-                          border: const OutlineInputBorder(
-                            borderRadius: BorderRadius.only(
-                              topLeft: Radius.circular(6),
-                              bottomLeft: Radius.circular(6),
-                              topRight: Radius.circular(0),
-                              bottomRight: Radius.circular(0),
-                            ),
-                            borderSide: BorderSide.none,
-                          ),
-                          hintText: 'Sample Label',
-                          hintStyle: TextStyle(color: Colors.grey[700]),
-                        ),
-                        enabled: false,
-                      ),
-                    ),
-                    const SizedBox(width: 2),
-                    // Disabled color picker button
-                    SizedBox(
-                      width: 48,
-                      height: 36,
-                      child: ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          shape: const RoundedRectangleBorder(
-                            borderRadius: BorderRadius.only(
-                              topLeft: Radius.circular(0),
-                              bottomLeft: Radius.circular(0),
-                              topRight: Radius.circular(6),
-                              bottomRight: Radius.circular(6),
-                            ),
-                          ),
-                          padding: EdgeInsets.zero,
-                          backgroundColor: disabledBgColor,
-                          foregroundColor: Colors.grey[700],
-                          elevation: 0,
-                        ),
-                        onPressed: null,
-                        child: const Icon(Icons.palette, size: 20),
-                      ),
-                    ),
-                  ],
-                );
-              },
+                },
+              ),
             ),
           ),
-          
-          // Playback controls
-          Container(
-            padding: const EdgeInsets.only(left: 16, right: 0),
-            child: Builder(
-              builder: (context) {
-                final hasSelectedSample = _selectedSample != null;
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                  mainAxisAlignment: MainAxisAlignment.start,
-                  children: [
-                    _buildRectControlButton(
-                      Icons.first_page,
-                      'Rewind',
-                      onPressed: hasSelectedSample
-                          ? () {
-                              final audioProvider = Provider.of<AudioProvider>(context, listen: false);
-                              audioProvider.seek(Duration.zero);
-                                  // Lock playhead to start
-                                  if (_selectedSample != null) {
-                                    final durationMs = _selectedSample!.duration.inMilliseconds > 0 ? _selectedSample!.duration.inMilliseconds : 1;
-                                    final startFrac = (_selectedSample!.startTime.inMilliseconds / durationMs).clamp(0.0, 1.0);
-                                    setState(() {
-                                      _playheadLockedToStart = true;
-                                      _playheadPosition = startFrac;
-                                    });
-                                  }
-                            }
-                          : null,
-                      enabled: hasSelectedSample,
-                    ),
-                    const SizedBox(width: 2),
-                    _buildRectControlButton(
-                      Icons.play_arrow,
-                      'Play',
-                      onPressed: hasSelectedSample
-                          ? () {
-                              final audioProvider = Provider.of<AudioProvider>(context, listen: false);
-                              audioProvider.play();
-                                  // Unlock playhead to follow playback
-                                  setState(() {
-                                    _playheadLockedToStart = false;
-                                  });
-                            }
-                          : null,
-                      enabled: hasSelectedSample,
-                    ),
-                    const SizedBox(width: 2),
-                    _buildRectControlButton(
-                      Icons.pause,
-                      'Pause',
-                      onPressed: hasSelectedSample
-                          ? () {
-                              final audioProvider = Provider.of<AudioProvider>(context, listen: false);
-                              audioProvider.pause();
-                            }
-                          : null,
-                      enabled: hasSelectedSample,
-                    ),
-                    const SizedBox(width: 2),
-                    _buildRectControlButton(
-                      Icons.stop,
-                      'Stop',
-                      onPressed: hasSelectedSample
-                          ? () {
-                              final audioProvider = Provider.of<AudioProvider>(context, listen: false);
-                              audioProvider.stop();
-                                  // Lock playhead to start
-                                  if (_selectedSample != null) {
-                                    final durationMs = _selectedSample!.duration.inMilliseconds > 0 ? _selectedSample!.duration.inMilliseconds : 1;
-                                    final startFrac = (_selectedSample!.startTime.inMilliseconds / durationMs).clamp(0.0, 1.0);
-                                    setState(() {
-                                      _playheadLockedToStart = true;
-                                      _playheadPosition = startFrac;
-                                    });
-                                  }
-                            }
-                          : null,
-                      enabled: hasSelectedSample,
-                    ),
-                  ],
-                    ),
-                    const SizedBox(height: 8),
-                    // Playback time display
-                    Consumer<AudioProvider>(
-                      builder: (context, audioProvider, _) {
-                        final sample = _selectedSample;
-                        if (sample == null) {
-                          return Text(
-                            '00:00:00 / 00:00:00',
-                            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                              fontWeight: FontWeight.bold,
-                              color: Colors.grey[600],
-                            ),
-                          );
-                        }
-                        
-                        // Only show playback time if this sample is actually playing
-                        final isPlayingThis = audioProvider.isPlaying && audioProvider.playingSample?.id == sample.id;
-                        
-                        final start = sample.startTime;
-                        final end = (sample.endTime > Duration.zero && sample.endTime < sample.duration)
-                            ? sample.endTime
-                            : sample.duration;
-                        
-                        if (isPlayingThis) {
-                          // Show actual playback position when this sample is playing
-                          final position = audioProvider.position + start;
-                          return Text(
-                            '${formatDuration(position)} / ${formatDuration(end)}',
-                            style: Theme.of(context).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.bold),
-                          );
-                        } else {
-                          // Show static time display when not playing
-                          return Text(
-                            '${formatDuration(start)} / ${formatDuration(end)}',
-                            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                              fontWeight: FontWeight.bold,
-                              color: Colors.grey[600],
-                            ),
-                          );
-                        }
-                      },
-                    ),
-                  ],
-                );
-              },
-            ),
-          ),
-          
+
           // Fader controls
           if (_selectedSample != null)
             Padding(
@@ -897,40 +886,23 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
     );
   }
 
-  Widget _buildControlButton(IconData icon, String tooltip) {
-    return Container(
-      width: 40,
-      height: 40,
-      decoration: BoxDecoration(
-        color: Colors.grey[700],
-        shape: BoxShape.circle,
-      ),
-      child: IconButton(
-        icon: Icon(icon, color: Colors.white, size: 20),
-        onPressed: () {
-          // TODO: Implement playback controls
-        },
-        tooltip: tooltip,
-      ),
-    );
-  }
+  // (removed) _buildControlButton was unused
 
   Widget _buildBottomPanel() {
     final hasSelectedSample = _selectedSample != null;
-    // Temporary: get the first sample with waveformData
-    final sampleProvider = Provider.of<SampleProvider>(context, listen: false);
-    AudioSample? debugSample;
-    try {
-      debugSample = sampleProvider.samples.firstWhere(
-        (s) => s.waveformData != null && s.waveformData!.isNotEmpty,
-      );
-    } catch (e) {
-      debugSample = null;
-    }
+  // (removed) unused debugSample lookup
     return Stack(
+      key: _panelStackKey,
       children: [
         Container(
-          height: 200,
+          // Responsive height: shorter on phone landscape
+          // Tablet/desktop: 240; Phone landscape: 140
+          height: () {
+            final media = MediaQuery.of(context);
+            final bool isLandscape = media.orientation == Orientation.landscape;
+            final bool isPhone = media.size.shortestSide < 600;
+            return (isPhone && isLandscape) ? 140.0 : 240.0;
+          }(),
           decoration: BoxDecoration(
             color: Theme.of(context).colorScheme.surface,
             borderRadius: BorderRadius.circular(2),
@@ -944,94 +916,213 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                     children: [
                       // Replace the time label Row with a CustomPaint for grid lines, labels, and playhead
                       SizedBox(
+                        key: _timeBarKey,
                         height: 20,
                         child: Consumer<AudioProvider>(
                           builder: (context, audioProvider, _) {
                             final sample = _selectedSample;
                             final duration = sample?.duration ?? Duration.zero;
                             final durationMs = duration.inMilliseconds > 0 ? duration.inMilliseconds : 1;
-                            final startFrac = (_selectedSample?.startTime.inMilliseconds ?? 0) / durationMs;
-                            final endFrac = (_selectedSample?.endTime.inMilliseconds ?? 0) > 0 
-                                ? (_selectedSample!.endTime.inMilliseconds / durationMs).clamp(0.0, 1.0)
-                                : 1.0;
-                            return GestureDetector(
-                              onTapDown: (details) {
-                                // Calculate position from tap
-                                final RenderBox renderBox = context.findRenderObject() as RenderBox;
-                                final localPosition = renderBox.globalToLocal(details.globalPosition);
-                                final tapFrac = (localPosition.dx / renderBox.size.width).clamp(0.0, 1.0);
-                                final clampedFrac = tapFrac.clamp(startFrac, endFrac);
-                                
-                                // Set playhead position
-                                setState(() {
-                                  _playheadPosition = clampedFrac;
-                                  _playheadLockedToStart = false;
-                                });
-                                
-                                // Seek to position
-                                final seekPosition = Duration(milliseconds: (clampedFrac * durationMs).round());
-                                audioProvider.seek(seekPosition);
-                              },
-                              child: SizedBox(
-                                width: double.infinity,
-                                height: 32,
-                                child: CustomPaint(
-                                  painter: _TimeGridPainter(
-                                    duration: duration,
-                                    position: _calculatePlayheadPosition(sample, audioProvider),
-                                    trimStart: sample?.startTime,
-                                    trimEnd: (sample != null && sample.endTime > Duration.zero) ? sample.endTime : null,
-                                    labelStyle: TextStyle(
-                                      color: hasSelectedSample ? Colors.grey : Colors.grey.withOpacity(0.3),
-                                      fontSize: 10,
+                            // Tap/drag clamping computed inside inner GestureDetector using sample times
+                            return StatefulBuilder(
+                                builder: (context, setInnerState) {
+                                  return GestureDetector(
+                                    onTapDown: (details) {
+                                      if (sample == null) return;
+                                      final renderBox = context.findRenderObject() as RenderBox;
+                                      final local = details.localPosition;
+                                      final width = renderBox.size.width;
+                                      final dx = local.dx.clamp(0.0, width);
+                                      final startFrac = (sample.startTime.inMilliseconds / durationMs).clamp(0.0, 1.0);
+                                      final endFrac = (sample.endTime > Duration.zero)
+                                          ? (sample.endTime.inMilliseconds / durationMs).clamp(0.0, 1.0)
+                                          : 1.0;
+                                      final frac = (dx / width).clamp(startFrac, endFrac);
+                                      // Absolute time along full file
+                                      final seekAbs = Duration(milliseconds: (frac * durationMs).round());
+                                      // For trimmed samples, the player expects clip-relative seek (0 at trim start)
+                                      final seekTarget = sample.isTrimmed
+                                          ? seekAbs - sample.startTime
+                                          : seekAbs;
+                                      setState(() {
+                                        _playheadLockedToStart = false;
+                                        _playheadPosition = frac;
+                                        _userHasSought = true;
+                                      });
+                                      audioProvider.seek(seekTarget);
+                                    },
+                                    onHorizontalDragStart: (details) async {
+                                      if (sample == null) return;
+                                      // If currently playing, pause so we can scrub precisely
+                                      if (audioProvider.isPlaying) {
+                                        await audioProvider.pause();
+                                      }
+                                      final renderBox = context.findRenderObject() as RenderBox;
+                                      final local = details.localPosition;
+                                      final width = renderBox.size.width;
+                                      final dx = local.dx.clamp(0.0, width);
+                                      final startFrac = (sample.startTime.inMilliseconds / durationMs).clamp(0.0, 1.0);
+                                      final endFrac = (sample.endTime > Duration.zero)
+                                          ? (sample.endTime.inMilliseconds / durationMs).clamp(0.0, 1.0)
+                                          : 1.0;
+                                      final frac = (dx / width).clamp(startFrac, endFrac);
+                                      final seekAbs = Duration(milliseconds: (frac * durationMs).round());
+                                      final seekTarget = sample.isTrimmed
+                                          ? seekAbs - sample.startTime
+                                          : seekAbs;
+                                      setState(() {
+                                        _playheadLockedToStart = false;
+                                        _playheadPosition = frac;
+                                        _timeTooltipPosition = Offset(dx, 0);
+                                        _timeTooltipText = formatDuration(seekAbs);
+                                        _userHasSought = true;
+                                      });
+                                      audioProvider.seek(seekTarget);
+                                    },
+                                    onHorizontalDragUpdate: (details) {
+                                      if (sample == null) return;
+                                      final renderBox = context.findRenderObject() as RenderBox;
+                                      final width = renderBox.size.width;
+                                      final dxRaw = details.localPosition.dx;
+                                      final dx = dxRaw.clamp(0.0, width);
+                                      final startFrac = (sample.startTime.inMilliseconds / durationMs).clamp(0.0, 1.0);
+                                      final endFrac = (sample.endTime > Duration.zero)
+                                          ? (sample.endTime.inMilliseconds / durationMs).clamp(0.0, 1.0)
+                                          : 1.0;
+                                      final frac = (dx / width).clamp(startFrac, endFrac);
+                                      final seekAbs = Duration(milliseconds: (frac * durationMs).round());
+                                      final seekTarget = sample.isTrimmed
+                                          ? seekAbs - sample.startTime
+                                          : seekAbs;
+                                      setState(() {
+                                        _playheadPosition = frac;
+                                        _timeTooltipPosition = Offset(dx, 0);
+                                        _timeTooltipText = formatDuration(seekAbs);
+                                        _userHasSought = true;
+                                      });
+                                      audioProvider.seek(seekTarget);
+                                    },
+                                    onHorizontalDragEnd: (_) {
+                                      if (audioProvider.isPlaying) return;
+                                      setState(() {
+                                        _timeTooltipPosition = null;
+                                        _timeTooltipText = null;
+                                      });
+                                    },
+                                    child: Stack(
+                                      children: [
+                SizedBox(
+                                          width: double.infinity,
+                                          height: double.infinity,
+                                          child: CustomPaint(
+                                            painter: _TimeGridPainter(
+                                              duration: duration,
+                  // Hide built-in playhead; we draw a single overlay across both windows
+                  position: const Duration(milliseconds: -1),
+                                              trimStart: sample?.startTime,
+                                              trimEnd: (sample != null && sample.endTime > Duration.zero) ? sample.endTime : null,
+                                              labelStyle: TextStyle(
+                                                color: hasSelectedSample ? Colors.grey : Colors.grey.withValues(alpha: 0.3),
+                                                fontSize: 10,
+                                              ),
+                                              formatDuration: formatDuration,
+                                              numLabels: 6,
+                                              gridColor: hasSelectedSample ? Colors.grey.withValues(alpha: 0.3) : Colors.grey.withValues(alpha: 0.1),
+                                            ),
+                                          ),
+                                        ),
+                                        if (_timeTooltipPosition != null && _timeTooltipText != null)
+                                          Positioned(
+                                            left: _timeTooltipPosition!.dx,
+                                            top: 0,
+                                            child: Material(
+                                              color: Colors.transparent,
+                                              child: Container(
+                                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                                decoration: BoxDecoration(
+                                                  color: Colors.black.withValues(alpha: 0.8),
+                                                  borderRadius: BorderRadius.circular(6),
+                                                ),
+                                                child: Text(
+                                                  _timeTooltipText!,
+                                                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                      ],
                                     ),
-                                    formatDuration: formatDuration,
-                                  ),
-                                ),
-                              ),
+                                  );
+                                },
                             );
                           },
                         ),
                       ),
                       const SizedBox(height: 1),
-                      Expanded(
+            Expanded(
                         child: Container(
+              key: _waveformKey,
                           decoration: BoxDecoration(
                             color: hasSelectedSample
-                                ? Colors.black.withOpacity(0.3)
-                                : Colors.grey.withOpacity(0.1),
+                                ? Colors.black.withValues(alpha: 0.3)
+                                : Colors.grey.withValues(alpha: 0.1),
                             borderRadius: BorderRadius.circular(4),
                           ),
                           child: Stack(
                             children: [
                               if (hasSelectedSample && _selectedSample!.waveformData != null && _selectedSample!.waveformData!.isNotEmpty)
-                                Center(
-                                  child: Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: 0),
-                                    child: LayoutBuilder(
-                                      builder: (context, constraints) {
-                                        final sliderPos = _gainSliderPositionForSample(_selectedSample!); // 0.0 - 1.0
-                                        final double baseHeight = constraints.maxHeight;
-                                        final double baseWidth = constraints.maxWidth;
-                                        // Headroom-aware visual: keep full height at 0 dB (slider = 0.5),
-                                        // increase density by scaling samples, not container height.
-                                        final samples = _scaledWaveformSamplesForDisplay(_selectedSample!);
-                                        // Height scales 0..baseHeight for visual feedback below 0 dB
-                                        final double scaledHeight = sliderPos < 0.5 ? baseHeight * (2.0 * sliderPos) : baseHeight;
-                                        return PolygonWaveform(
-                                          samples: samples.isEmpty ? _selectedSample!.waveformData! : samples,
-                                          height: scaledHeight,
-                                          width: baseWidth,
-                                          inactiveColor: Colors.white.withOpacity(0.4),
-                                          activeColor: Colors.white,
-                                          showActiveWaveform: false,
-                                        );
-                                      },
+                                RepaintBoundary(
+                                  child: Center(
+                                    child: Padding(
+                                      padding: const EdgeInsets.symmetric(horizontal: 0),
+                                      child: LayoutBuilder(
+                                        builder: (context, constraints) {
+                                          return _WaveformFillOptimized(
+                                            magnitude: _selectedSample!.waveformData!,
+                                            width: constraints.maxWidth,
+                                            height: constraints.maxHeight,
+                                            gainDb: _selectedSample!.gainDb,
+                                            compressionStrength: 2.2,
+                                            edgeMarginPx: 2.0,
+                                            visualScale: 0.9,
+                                            fillColor: Colors.grey.shade200,
+                                            strokeColor: Colors.white,
+                                            drawStroke: true,
+                                          );
+                                        },
+                                      ),
                                     ),
                                   ),
                                 ),
                               if (hasSelectedSample)
                                 _buildTrimHandles(context, _selectedSample!, hasSelectedSample),
+                              // Waveform loading overlay
+                              if (hasSelectedSample && (_selectedSample!.isWaveformLoading || _selectedSample!.waveformData == null || _selectedSample!.waveformData!.isEmpty))
+                                Positioned.fill(
+                                  child: Container(
+                                    decoration: BoxDecoration(
+                                      color: Colors.black.withValues(alpha: 0.5),
+                                      borderRadius: BorderRadius.circular(4),
+                                    ),
+                                    child: Center(
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          const SizedBox(
+                                            width: 20,
+                                            height: 20,
+                                            child: CircularProgressIndicator(strokeWidth: 2),
+                                          ),
+                                          const SizedBox(height: 8),
+                                          Text(
+                                            'Analyzing waveform…',
+                                            style: TextStyle(color: Colors.white.withValues(alpha: 0.9)),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
                               if (_dragTooltipPosition != null && _dragTooltipText != null)
                                 Positioned(
                                   left: _dragTooltipPosition!.dx,
@@ -1041,7 +1132,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                                     child: Container(
                                       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                                       decoration: BoxDecoration(
-                                        color: Colors.black.withOpacity(0.8),
+                                        color: Colors.black.withValues(alpha: 0.8),
                                         borderRadius: BorderRadius.circular(6),
                                       ),
                                       child: Text(_dragTooltipText!, style: const TextStyle(color: Colors.white, fontSize: 12)),
@@ -1056,13 +1147,13 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                                       Icon(
                                         Icons.graphic_eq,
                                         size: 48,
-                                        color: Colors.grey.withOpacity(0.5),
+                                        color: Colors.grey.withValues(alpha: 0.5),
                                       ),
                                       const SizedBox(height: 8),
                                       Text(
                                         'Select a sample',
                                         style: TextStyle(
-                                          color: Colors.grey.withOpacity(0.7),
+                                          color: Colors.grey.withValues(alpha: 0.7),
                                           fontSize: 14,
                                         ),
                                       ),
@@ -1073,11 +1164,25 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                           ),
                         ),
                       ),
+                      // Controls moved to right panel for phone/tablet
                     ],
                   ),
                 ),
               ),
             ],
+          ),
+        ),
+        // Overlay a single playhead across both time bar and waveform
+        Positioned.fill(
+          child: IgnorePointer(
+            ignoring: true,
+            child: Consumer<AudioProvider>(
+              builder: (context, audioProvider, _) {
+                return CustomPaint(
+                  painter: _UnifiedPlayheadPainter(state: this, repaint: audioProvider),
+                );
+              },
+            ),
           ),
         ),
       ],
@@ -1112,7 +1217,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
             height: 24,
             decoration: BoxDecoration(
               color: label == '+'
-                  ? Colors.grey[700]?.withOpacity(0.25)
+                  ? (Colors.grey[700] ?? Colors.grey).withValues(alpha: 0.25)
                   : (isCurrentPage ? Colors.yellow : Colors.grey[700]),
               borderRadius: BorderRadius.circular(4),
             ),
@@ -1137,62 +1242,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
     );
   }
 
-  void _showSampleContextMenu(BuildContext context, AudioSample sample) {
-    final RenderBox button = context.findRenderObject() as RenderBox;
-    final position = button.localToGlobal(Offset.zero);
-    
-    showMenu(
-      context: context,
-      position: RelativeRect.fromLTRB(
-        position.dx,
-        position.dy - 50,
-        position.dx + 120,
-        position.dy + 80,
-      ),
-      items: [
-        PopupMenuItem<String>(
-          value: 'change_color',
-          child: Row(
-            children: [
-              Icon(Icons.palette, color: Colors.blue, size: 20),
-              const SizedBox(width: 8),
-              const Text('Change Color'),
-            ],
-          ),
-        ),
-        PopupMenuItem<String>(
-          value: 'duplicate',
-          child: Row(
-            children: [
-              Icon(Icons.copy, color: Colors.orange, size: 20),
-              const SizedBox(width: 8),
-              const Text('Duplicate'),
-            ],
-          ),
-        ),
-        PopupMenuItem<String>(
-          value: 'delete',
-          child: Row(
-            children: [
-              Icon(Icons.delete, color: Colors.red, size: 20),
-              const SizedBox(width: 8),
-              const Text('Delete'),
-            ],
-          ),
-        ),
-      ],
-    ).then((value) async {
-      if (value == 'change_color') {
-        await _showGridColorPicker(context, sample);
-      } else if (value == 'duplicate') {
-        final sampleProvider = Provider.of<SampleProvider>(context, listen: false);
-        sampleProvider.duplicateSample(sample.id);
-      } else if (value == 'delete') {
-        final sampleProvider = Provider.of<SampleProvider>(context, listen: false);
-        sampleProvider.deleteSample(sample.id);
-      }
-    });
-  }
+  // (removed) _showSampleContextMenu was unused
 
   Future<void> _showGridColorPicker(BuildContext context, AudioSample sample) async {
     final List<Color> colors = [
@@ -1232,7 +1282,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
               return GestureDetector(
                 onTap: () {
                   final sampleProvider = Provider.of<SampleProvider>(context, listen: false);
-                  sampleProvider.updateSampleColor(sample.id, colors[index].value);
+                  sampleProvider.updateSampleColor(sample.id, colors[index].toARGB32());
                   Navigator.of(context).pop();
                 },
                 child: Container(
@@ -1357,9 +1407,8 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
     // Get filename without extension for default name
     final fileName = filePath.split('/').last.split('.').first;
 
-    // Generate waveform data and get actual duration
-    final waveformData = await audioProvider.generateWaveformData(filePath);
-    final actualDuration = await audioProvider.getAudioDuration(filePath);
+  // Get duration quickly, then add a shell sample so it appears immediately
+  final actualDuration = await audioProvider.getAudioDuration(filePath);
     
     if (sampleId != null) {
       // Update existing blank sample
@@ -1368,7 +1417,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
         filePath,
         fileName,
         actualDuration,
-        waveformData: waveformData,
+        waveformData: null,
       );
       // Auto-select only if nothing is currently playing
       final updatedSample = sampleProvider.getSampleById(sampleId);
@@ -1376,25 +1425,29 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
       if (updatedSample != null && !audioProviderNow.isPlaying) {
         _selectSample(updatedSample);
       }
+      // Generate waveform in background and update
+      final waveformData = await audioProvider.generateWaveformData(filePath);
+      if (waveformData != null) {
+        await sampleProvider.setSampleWaveform(sampleId, waveformData);
+      }
     } else {
-      // Create new sample with default values
-      final newSample = AudioSample(
-        id: DateTime.now().millisecondsSinceEpoch.toString(),
+      // Create shell then generate waveform asynchronously
+      final shell = await sampleProvider.addSampleShell(
         name: fileName,
+        category: 'General',
         filePath: filePath,
         duration: actualDuration,
-        category: 'General',
         notes: null,
-        isBlank: false,
-        createdAt: DateTime.now(),
-        lastModified: DateTime.now(),
-        waveformData: waveformData,
       );
-      await sampleProvider.addSample(newSample);
       // Auto-select only if nothing is currently playing
       final audioProviderNow = Provider.of<AudioProvider>(context, listen: false);
       if (!audioProviderNow.isPlaying) {
-        _selectSample(newSample);
+        final latest = sampleProvider.getSampleById(shell.id) ?? shell;
+        _selectSample(latest);
+      }
+      final waveformData = await audioProvider.generateWaveformData(filePath);
+      if (waveformData != null) {
+        await sampleProvider.setSampleWaveform(shell.id, waveformData);
       }
     }
   }
@@ -1402,7 +1455,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
   void _handleDragEnd(DraggableDetails details, AudioSample sample, SampleProvider sampleProvider) {
     // Get the screen size
     final screenSize = MediaQuery.of(context).size;
-    final edgeThreshold = 20.0; // Distance from edge to trigger delete
+    const edgeThreshold = 20.0; // Distance from edge to trigger delete
     
     // Check if dragged to any edge of the screen
     final isNearLeftEdge = details.offset.dx < edgeThreshold;
@@ -1502,12 +1555,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
 
   bool _showDeleteConfirmation = true; // Default to showing confirmation
 
-  Color _getSampleButtonColor(AudioSample sample) {
-    if (sample.customColor != null) {
-      return Color(sample.customColor!);
-    }
-    return Theme.of(context).colorScheme.outline.withOpacity(0.3);
-  }
+  // (removed) _getSampleButtonColor was unused
 
   Widget _buildTrimHandles(BuildContext context, AudioSample sample, bool hasSelectedSample) {
     final duration = sample.duration.inMilliseconds > 0 ? sample.duration : const Duration(seconds: 1);
@@ -1515,11 +1563,11 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
     final startFrac = _isDraggingStart && _draggingTrimStart != null
         ? _draggingTrimStart!
         : (sample.startTime.inMilliseconds / durationMs).clamp(0.0, 1.0);
-    final endFrac = _isDraggingEnd && _draggingTrimEnd != null
-        ? _draggingTrimEnd!
-        : (sample.endTime.inMilliseconds > 0
-            ? (sample.endTime.inMilliseconds / durationMs).clamp(0.0, 1.0)
-            : 1.0);
+  final endFrac = _isDraggingEnd && _draggingTrimEnd != null
+    ? _draggingTrimEnd!
+    : (sample.endTime.inMilliseconds > 0
+      ? (sample.endTime.inMilliseconds / durationMs).clamp(0.0, 1.0)
+      : 1.0);
     
     // Calculate playhead position
     final audioProvider = Provider.of<AudioProvider>(context, listen: false);
@@ -1543,14 +1591,13 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
       playheadFrac = playheadFrac.clamp(0.0, 1.0);
     }
     
-    final panel = context.findRenderObject() as RenderBox?;
+  // "panel" render box not used currently; kept for potential overlay alignment in future
     return LayoutBuilder(
       builder: (context, constraints) {
         final width = constraints.maxWidth;
-        // Set handleWidth to 2.0 (visible), but tappable area to 48.0
-        final handleWidth = 2.0;
-        final handleTapWidth = 48.0;
-        final minFrac = _minTrimFraction;
+  // Tappable area is 32px centered on the trim point (±16px)
+  const handleTapWidth = 32.0;
+        const minFrac = _minTrimFraction;
         final minDistPx = minFrac * width;
         // Remove duplicate duration definition - use the one from outer scope
         // Remove duplicate startFrac and endFrac definitions - use the ones from outer scope
@@ -1558,33 +1605,23 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
         final endPx = endFrac * width;
         return Stack(
           children: [
-            // Trim overlay (exclude handle areas)
-            Positioned(
-              left: startPx + handleWidth,
-              width: (endPx - handleWidth) - (startPx + handleWidth),
-              top: 0,
-              bottom: 0,
-              child: Container(
-                decoration: BoxDecoration(
-                  color: Colors.yellow.withOpacity(0.05),
-                  border: Border.all(color: Colors.yellow, width: 1),
+            // Chamfered trim region (matches PNG): thin yellow border, subtle fill
+    Positioned.fill(
+              child: CustomPaint(
+                painter: _TrimRegionPainter(
+                  startFrac: startFrac,
+                  endFrac: endFrac,
+  fillColor: Colors.yellow.withValues(alpha: 0.05),
+                  borderColor: Colors.yellow,
+                  chamfer: 10.0,
+                  borderWidth: 1.0,
                 ),
               ),
             ),
-            // Playhead (visible when within container bounds)
-            if (playheadFrac >= 0.0 && playheadFrac <= 1.0)
-              Positioned(
-                left: (playheadFrac * width) - 1.0,
-                top: 0,
-                bottom: 0,
-                child: Container(
-                  width: 2.0,
-                  color: Colors.blue,
-                ),
-              ),
+            // Playhead line removed; unified overlay painter draws a single line across time bar and waveform
             // Start handle
             Positioned(
-              left: startPx.clamp(0.0, width - handleWidth),
+              left: (startPx - (handleTapWidth / 2)).clamp(0.0, width - handleTapWidth),
               top: 0,
               bottom: 0,
               child: Container(
@@ -1598,7 +1635,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                   final playingThis = audioProvider.isPlaying && audioProvider.playingSample?.id == sample.id;
                   if (playingThis) {
                     final playheadX = (playheadFrac * width);
-                    final handleLeft = startPx.clamp(0.0, width - handleWidth);
+                    final handleLeft = (startPx - (handleTapWidth / 2)).clamp(0.0, width - handleTapWidth);
                     final handleRight = (handleLeft + handleTapWidth).clamp(0.0, width);
                     if (playheadX >= handleLeft && playheadX <= handleRight) {
                       audioProvider.stop();
@@ -1608,21 +1645,38 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                 onHorizontalDragStart: (details) {
                   setState(() {
                     _isDraggingStart = true;
+            _dragAccumDxStart = 0.0;
+            _dragStartBasePxStart = startPx; // capture base position at drag start
                       _draggingTrimStartTime = Duration(milliseconds: (startFrac * durationMs).round());
                   });
                 },
                 onHorizontalDragUpdate: (details) {
-                  final localX = (startPx + details.delta.dx).clamp(0.0, endPx - minDistPx);
+                  _dragAccumDxStart += details.delta.dx;
+                  final localX = (_dragStartBasePxStart + _dragAccumDxStart).clamp(0.0, endPx - minDistPx);
                   final newFrac = (localX / width).clamp(0.0, endFrac - minFrac);
                   setState(() {
                     _draggingTrimStart = newFrac;
                       _draggingTrimStartTime = Duration(milliseconds: (newFrac * durationMs).round());
+                    _dragTooltipPosition = Offset(localX, 0);
+                    _dragTooltipText = formatDuration(Duration(milliseconds: (newFrac * durationMs).round()));
                     final audioProvider = Provider.of<AudioProvider>(context, listen: false);
                     final isPlayingThis = audioProvider.isPlaying && audioProvider.playingSample?.id == sample.id;
                     if (!isPlayingThis && _playheadLockedToStart) {
                       _playheadPosition = newFrac;
                     }
                   });
+                  // If playing, stop immediately if playhead leaves new trim region
+                  final audioProviderCheck = Provider.of<AudioProvider>(context, listen: false);
+                  final playingThisNow = audioProviderCheck.isPlaying && audioProviderCheck.playingSample?.id == sample.id;
+                  if (playingThisNow) {
+                    final playbackPositionMs = audioProviderCheck.position.inMilliseconds;
+                    final startAbsMs = (newFrac * durationMs).round();
+                    final endAbsMs = sample.endTime.inMilliseconds > 0 ? sample.endTime.inMilliseconds : durationMs;
+                    final currentAbsMs = playbackPositionMs + sample.startTime.inMilliseconds;
+                    if (currentAbsMs <= startAbsMs || currentAbsMs >= endAbsMs) {
+                      audioProviderCheck.stop();
+                    }
+                  }
                 },
                 onHorizontalDragEnd: (details) async {
                   final newStartFrac = _draggingTrimStart ?? startFrac;
@@ -1677,12 +1731,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                   child: Stack(
                     alignment: Alignment.centerLeft,
                     children: [
-                      Image.asset(
-                        'assets/images/trim_handle_start.png',
-                        width: handleWidth,
-                        height: constraints.maxHeight,
-                        fit: BoxFit.fitHeight,
-                      ),
+                      // Visual is provided by the chamfered region painter; no extra line needed.
                       if (_isDraggingStart && _draggingTrimStartTime != null)
                         Positioned(
                           top: -32,
@@ -1691,7 +1740,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                             child: Container(
                               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                               decoration: BoxDecoration(
-                                color: Colors.black.withOpacity(0.8),
+                                color: Colors.black.withValues(alpha: 0.8),
                                 borderRadius: BorderRadius.circular(6),
                               ),
                               child: Text(
@@ -1708,7 +1757,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
             ),
             // End handle
             Positioned(
-              left: endPx.clamp(0.0, width - handleWidth),
+              left: (endPx - (handleTapWidth / 2)).clamp(0.0, width - handleTapWidth),
               top: 0,
               bottom: 0,
               child: Container(
@@ -1722,7 +1771,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                   final playingThis = audioProvider.isPlaying && audioProvider.playingSample?.id == sample.id;
                   if (playingThis) {
                     final playheadX = (playheadFrac * width);
-                    final handleLeft = endPx.clamp(0.0, width - handleWidth);
+                    final handleLeft = (endPx - (handleTapWidth / 2)).clamp(0.0, width - handleTapWidth);
                     final handleRight = (handleLeft + handleTapWidth).clamp(0.0, width);
                     if (playheadX >= handleLeft && playheadX <= handleRight) {
                       audioProvider.stop();
@@ -1732,11 +1781,14 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                 onHorizontalDragStart: (details) {
                   setState(() {
                     _isDraggingEnd = true;
+            _dragAccumDxEnd = 0.0;
+            _dragStartBasePxEnd = endPx; // capture base position at drag start
                       _draggingTrimEndTime = Duration(milliseconds: (endFrac * durationMs).round());
                   });
                 },
                 onHorizontalDragUpdate: (details) {
-                  final localX = (endPx + details.delta.dx).clamp(startPx + minDistPx, width);
+          _dragAccumDxEnd += details.delta.dx;
+          final localX = (_dragStartBasePxEnd + _dragAccumDxEnd).clamp(startPx + minDistPx, width);
                   final newFrac = (localX / width).clamp(startFrac + minFrac, 1.0);
                   setState(() {
                     _draggingTrimEnd = newFrac;
@@ -1762,6 +1814,18 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                       );
                     }
                   });
+                  // If playing, stop immediately if playhead leaves new trim region
+                  final audioProviderCheck = Provider.of<AudioProvider>(context, listen: false);
+                  final playingThisNow = audioProviderCheck.isPlaying && audioProviderCheck.playingSample?.id == sample.id;
+                  if (playingThisNow) {
+                    final playbackPositionMs = audioProviderCheck.position.inMilliseconds;
+                    final startAbsMs = sample.startTime.inMilliseconds;
+                    final endAbsMs = (newFrac * durationMs).round();
+                    final currentAbsMs = playbackPositionMs + sample.startTime.inMilliseconds;
+                    if (currentAbsMs <= startAbsMs || currentAbsMs >= endAbsMs) {
+                      audioProviderCheck.stop();
+                    }
+                  }
                 },
                 onHorizontalDragEnd: (details) async {
                   final newEndFrac = _draggingTrimEnd ?? endFrac;
@@ -1812,12 +1876,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                   child: Stack(
                     alignment: Alignment.centerLeft,
                     children: [
-                      Image.asset(
-                        'assets/images/trim_handle_end.png',
-                        width: handleWidth,
-                        height: constraints.maxHeight,
-                        fit: BoxFit.fitHeight,
-                      ),
+                      // Visual is provided by the chamfered region painter; no extra line needed.
                       if (_isDraggingEnd && _draggingTrimEndTime != null)
                         Positioned(
                           top: -32,
@@ -1826,7 +1885,7 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
                             child: Container(
                               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                               decoration: BoxDecoration(
-                                color: Colors.black.withOpacity(0.8),
+                                color: Colors.black.withValues(alpha: 0.8),
                                 borderRadius: BorderRadius.circular(6),
                               ),
                               child: Text(
@@ -1859,60 +1918,19 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
       _draggingTrimEndTime = null;
       _dragTooltipPosition = null;
       _dragTooltipText = null;
-      if (_selectedSample != null) {
-        // Initialize playhead to start of trim region
-        final durationMs = _selectedSample!.duration.inMilliseconds;
-        final startFrac = (_selectedSample!.startTime.inMilliseconds / (durationMs > 0 ? durationMs : 1)).clamp(0.0, 1.0);
-        _playheadPosition = startFrac;
-        _playheadLockedToStart = true;
-      }
+  // Do not show a playhead by default for inactive samples; only after user taps/drags
+  _playheadPosition = null;
+  _playheadLockedToStart = true;
+  _timeTooltipPosition = null;
+  _timeTooltipText = null;
+  _userHasSought = false;
     });
     // Update AudioProvider current sample to reset baseline trim tracking
     final audioProvider = Provider.of<AudioProvider>(context, listen: false);
     audioProvider.setCurrentSample(sample);
   }
 
-  Duration _calculatePlayheadPosition(AudioSample? sample, AudioProvider audioProvider) {
-    if (sample == null) {
-      return Duration.zero;
-    }
-    
-    // Only show playhead if this sample is actually playing
-    final bool isPlayingThis = audioProvider.isPlaying && audioProvider.playingSample?.id == sample.id;
-    if (!isPlayingThis) {
-      // Return a position that's outside the valid range to hide the playhead
-      return Duration(milliseconds: -1);
-    }
-    
-    final durationMs = sample.duration.inMilliseconds > 0 ? sample.duration.inMilliseconds : 1;
-    
-    // Use dragging values if currently dragging, otherwise use sample values
-    final startFrac = _isDraggingStart && _draggingTrimStart != null
-        ? _draggingTrimStart!
-        : (sample.startTime.inMilliseconds / durationMs).clamp(0.0, 1.0);
-    final endFrac = _isDraggingEnd && _draggingTrimEnd != null
-        ? _draggingTrimEnd!
-        : (sample.endTime.inMilliseconds > 0
-            ? (sample.endTime.inMilliseconds / durationMs).clamp(0.0, 1.0)
-            : 1.0);
-    
-    // Calculate playhead position using same logic as waveform
-    double playheadFrac;
-    if (_playheadLockedToStart) {
-      playheadFrac = startFrac;
-    } else {
-      // Use actual playback position; when playing, base on playingSample.startTime
-      final playbackPosition = audioProvider.position;
-      final effectiveStart = audioProvider.playingSample!.startTime;
-      final absolutePosition = playbackPosition + effectiveStart;
-      playheadFrac = (absolutePosition.inMilliseconds / durationMs);
-    }
-    // Allow free-running sync to audio when playing
-    playheadFrac = playheadFrac.clamp(0.0, 1.0);
-    
-    // Convert back to absolute position
-    return Duration(milliseconds: (playheadFrac * durationMs).round());
-  }
+  // (removed) _calculatePlayheadPosition was unused
 }
 
 
@@ -1965,7 +1983,7 @@ class _AddSampleDialogState extends State<AddSampleDialog> {
           Consumer<SampleProvider>(
             builder: (context, sampleProvider, child) {
               return DropdownButtonFormField<String>(
-                value: _selectedCategory,
+                initialValue: _selectedCategory,
                 decoration: const InputDecoration(
                   labelText: 'Category',
                   border: OutlineInputBorder(),
@@ -2091,7 +2109,8 @@ class _AddSampleDialogState extends State<AddSampleDialog> {
       await sampleProvider.addSample(newSample);
     }
 
-    Navigator.of(context).pop();
+  if (!mounted) return;
+  Navigator.of(context).pop();
   }
 
   @override
@@ -2195,7 +2214,7 @@ class _EditableSampleNameState extends State<_EditableSampleName> {
 
   @override
   Widget build(BuildContext context) {
-    final panelColor = Theme.of(context).colorScheme.surface;
+  // Panel color resolved via Theme below as needed
     return Selector<SampleProvider, AudioSample?>(
       selector: (context, sampleProvider) => sampleProvider.getSampleById(widget.sample.id),
       builder: (context, selectedSample, _) {
@@ -2203,7 +2222,7 @@ class _EditableSampleNameState extends State<_EditableSampleName> {
         if (selectedSample != null && selectedSample.customColor != null) {
           fillColor = Color(selectedSample.customColor!);
         } else {
-          fillColor = Theme.of(context).colorScheme.outline.withOpacity(0.3);
+          fillColor = Theme.of(context).colorScheme.outline.withValues(alpha: 0.3);
         }
         // Force white on default fill for active samples without custom color (same as sample button)
         Color textColor;
@@ -2330,8 +2349,8 @@ class _TimeGridPainter extends CustomPainter {
     this.trimEnd,
     required this.labelStyle,
     required this.formatDuration,
-    this.numLabels = 10,
-    this.gridColor = const Color(0xFF888888),
+    required this.numLabels,
+    required this.gridColor,
   });
 
   @override
@@ -2340,7 +2359,7 @@ class _TimeGridPainter extends CustomPainter {
     final double height = size.height;
     final double durationMs = duration.inMilliseconds > 0 ? duration.inMilliseconds.toDouble() : 1.0;
     final Paint gridPaint = Paint()
-      ..color = gridColor.withOpacity(0.5)
+  ..color = gridColor.withValues(alpha: 0.5)
       ..strokeWidth = 1;
     final Paint playheadPaint = Paint()
       ..color = Colors.blue
@@ -2436,6 +2455,66 @@ class _RectangularThumbShape extends SliderComponentShape {
   }
 }
 
+class _UnifiedPlayheadPainter extends CustomPainter {
+  final _MainSamplerScreenState state;
+  _UnifiedPlayheadPainter({required this.state, Listenable? repaint}) : super(repaint: repaint);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final ctx = state.context;
+    if (state._selectedSample == null) return;
+    final audioProvider = Provider.of<AudioProvider>(ctx, listen: false);
+  // Prefer provider's current sample for live-accurate trims during playback
+  final effectiveSample = (audioProvider.currentSample?.id == state._selectedSample!.id)
+    ? audioProvider.currentSample!
+    : state._selectedSample!;
+  final durationMs = (effectiveSample.duration.inMilliseconds > 0)
+    ? effectiveSample.duration.inMilliseconds
+    : 1;
+  // Consider "playing this" if the provider reports playing and the currentSample matches.
+  final isPlayingThis = audioProvider.isPlaying && audioProvider.currentSample?.id == effectiveSample.id;
+
+    // Determine fraction 0..1 along full duration
+    double? frac;
+    if (isPlayingThis) {
+      // Apply latency compensation for visual playhead while playing
+      final adjusted = audioProvider.position - audioProvider.latencyCompensation;
+      final safeAdjusted = adjusted.isNegative ? Duration.zero : adjusted;
+      final absMs = (safeAdjusted + effectiveSample.startTime).inMilliseconds.toDouble();
+      frac = (absMs / durationMs).clamp(0.0, 1.0);
+    } else if (audioProvider.currentSample?.id == effectiveSample.id) {
+      // Paused on this sample: keep playhead visible at the paused position (no latency offset)
+      final pausedAbsMs = (audioProvider.position + effectiveSample.startTime).inMilliseconds.toDouble();
+      frac = (pausedAbsMs / durationMs).clamp(0.0, 1.0);
+    } else if (state._userHasSought && state._playheadPosition != null) {
+      // Not the current sample; if the user has sought locally, show that position
+      frac = state._playheadPosition!.clamp(0.0, 1.0);
+    }
+    if (frac == null) return; // hide when not playing and not sought
+
+    // Compute rectangles for time bar and waveform within the panel stack
+    final panelBox = state._panelStackKey.currentContext?.findRenderObject() as RenderBox?;
+    if (panelBox == null || !panelBox.hasSize) return;
+    final timeRect = state._rectFor(state._timeBarKey, state._panelStackKey);
+    final waveRect = state._rectFor(state._waveformKey, state._panelStackKey);
+
+    final paint = Paint()
+      ..color = Colors.blue
+      ..strokeWidth = 2;
+
+    void drawLineAcross(Rect r) {
+      final x = r.left + r.width * frac!;
+      canvas.drawLine(Offset(x, r.top), Offset(x, r.bottom), paint);
+    }
+
+    if (timeRect != null) drawLineAcross(timeRect);
+    if (waveRect != null) drawLineAcross(waveRect);
+  }
+
+  @override
+  bool shouldRepaint(covariant _UnifiedPlayheadPainter oldDelegate) => true;
+}
+
 class _RectangularOverlayShape extends SliderComponentShape {
   const _RectangularOverlayShape();
 
@@ -2461,7 +2540,7 @@ class _RectangularOverlayShape extends SliderComponentShape {
   }) {
     final Canvas canvas = context.canvas;
     final Paint paint = Paint()
-      ..color = (sliderTheme.thumbColor ?? Colors.blue).withOpacity(0.2)
+  ..color = (sliderTheme.thumbColor ?? Colors.blue).withValues(alpha: 0.2)
       ..style = PaintingStyle.fill;
 
     // Draw a rectangular overlay
@@ -2474,6 +2553,190 @@ class _RectangularOverlayShape extends SliderComponentShape {
   }
 } 
 
+// Simple mirrored waveform renderer that fills symmetrically around center
+// Optimized waveform: downsample to ~1 point per pixel, LUT-compressed, fill-only mirrored
+class _WaveformFillOptimized extends StatelessWidget {
+  final List<double> magnitude; // [0,1] per source sample
+  final double width;
+  final double height;
+  final double gainDb;
+  final double compressionStrength; // e.g., 2.2
+  final double edgeMarginPx; // top/bottom margin
+  final double visualScale; // pre-compression visual scaler (0..1), e.g., 0.9
+  final Color fillColor;
+  final Color strokeColor; // optional center line only when drawStroke=true
+  final bool drawStroke;
+
+  const _WaveformFillOptimized({
+    required this.magnitude,
+    required this.width,
+    required this.height,
+    required this.gainDb,
+    required this.compressionStrength,
+    required this.edgeMarginPx,
+    this.visualScale = 0.9,
+    required this.fillColor,
+    required this.strokeColor,
+    this.drawStroke = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      size: Size(width, height),
+      painter: _WaveformFillOptimizedPainter(
+        magnitude: magnitude,
+        gainDb: gainDb,
+        compressionStrength: compressionStrength,
+        edgeMarginPx: edgeMarginPx,
+  visualScale: visualScale,
+        fillColor: fillColor,
+        strokeColor: strokeColor,
+        drawStroke: drawStroke,
+      ),
+    );
+  }
+}
+
+class _WaveformFillOptimizedPainter extends CustomPainter {
+  final List<double> magnitude; // [0,1]
+  final double gainDb;
+  final double compressionStrength;
+  final double edgeMarginPx;
+  final double visualScale;
+  final Color fillColor;
+  final Color strokeColor;
+  final bool drawStroke;
+
+  // Small LUT to avoid recomputing tanh per point when dragging gain
+  static const int _lutSize = 256;
+  static final Map<double, List<double>> _lutCache = {}; // key: compressionStrength
+
+  _WaveformFillOptimizedPainter({
+    required this.magnitude,
+    required this.gainDb,
+    required this.compressionStrength,
+    required this.edgeMarginPx,
+  required this.visualScale,
+    required this.fillColor,
+    required this.strokeColor,
+    required this.drawStroke,
+  });
+
+  List<double> _getLut(double strength) {
+    // Round strength to 2 decimals to bound cache keys
+    final double key = double.parse(strength.toStringAsFixed(2));
+    final existing = _lutCache[key];
+    if (existing != null) return existing;
+    // Build LUT for x in [0, 1.5] to allow some headroom before clamping
+    final List<double> lut = List.filled(_lutSize, 0.0);
+    double _tanh(double z) {
+      final double e2z = exp(2.0 * z);
+      return (e2z - 1.0) / (e2z + 1.0);
+    }
+    final double denom = _tanh(key);
+    for (int i = 0; i < _lutSize; i++) {
+      final double x = (i / (_lutSize - 1)) * 1.5; // 0..1.5
+      final double y = _tanh(key * x) / (denom == 0 ? 1.0 : denom);
+      lut[i] = y.clamp(0.0, 1.0);
+    }
+    _lutCache[key] = lut;
+    return lut;
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (magnitude.isEmpty || size.width <= 0 || size.height <= 0) return;
+
+    // Downsample to 1 value per pixel using max within each bucket for better peak visibility
+    final int targetPoints = size.width.ceil();
+    final int srcLen = magnitude.length;
+    final List<double> env = List<double>.filled(targetPoints, 0.0, growable: false);
+    for (int x = 0; x < targetPoints; x++) {
+      final int start = ((x / targetPoints) * srcLen).floor();
+      final int end = (((x + 1) / targetPoints) * srcLen).ceil().clamp(start + 1, srcLen);
+      double maxV = 0.0;
+      for (int i = start; i < end; i++) {
+        final v = magnitude[i].abs();
+        if (v > maxV) maxV = v;
+      }
+      env[x] = maxV;
+    }
+
+    final double amp = pow(10.0, gainDb / 20.0).toDouble().clamp(0.0, 4.0);
+    final lut = _getLut(compressionStrength);
+    double compress(double x) {
+      if (x <= 0) return 0.0;
+      // Map x to LUT index 0.._lutSize-1 based on x in 0..1.5 range
+      final double xi = (x * 1.0).clamp(0.0, 1.5) / 1.5;
+      final double f = xi * (lut.length - 1);
+      final int i0 = f.floor();
+      final int i1 = (i0 + 1).clamp(0, lut.length - 1);
+      final double t = f - i0;
+      return lut[i0] * (1 - t) + lut[i1] * t;
+    }
+
+    final double margin = edgeMarginPx.clamp(0.0, size.height / 3.0);
+    final double centerY = size.height / 2.0;
+    final double half = centerY - 1.0 - margin;
+    final Path fill = Path();
+    final List<Offset> upper = List.filled(env.length, Offset.zero);
+    for (int x = 0; x < env.length; x++) {
+      final double frac = env.length > 1 ? x / (env.length - 1) : 0.0;
+  final double vx = compress(env[x] * amp * visualScale).clamp(0.0, 1.0);
+      final double yOff = vx * half;
+      final double yUp = centerY - yOff;
+      final double px = frac * size.width;
+      final Offset p = Offset(px, yUp);
+      upper[x] = p;
+    }
+    if (upper.isEmpty) return;
+    fill.addPolygon(upper, false);
+    // Lower path reversed
+    for (int x = upper.length - 1; x >= 0; x--) {
+      final Offset up = upper[x];
+      final double dy = centerY - up.dy;
+      fill.lineTo(up.dx, centerY + dy);
+    }
+    fill.close();
+
+    final Paint fillPaint = Paint()
+      ..isAntiAlias = true
+      ..color = fillColor
+      ..style = PaintingStyle.fill;
+    canvas.drawPath(fill, fillPaint);
+
+    if (drawStroke) {
+      // Outline the waveform to keep shape visible in quiet areas
+      final Paint outline = Paint()
+        ..isAntiAlias = true
+  ..color = strokeColor.withValues(alpha: 0.9)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 0.5;
+      canvas.drawPath(fill, outline);
+
+      // Draw a faint center line across
+      final Paint centerPaint = Paint()
+        ..isAntiAlias = true
+  ..color = strokeColor.withValues(alpha: 0.18)
+        ..strokeWidth = 1.0;
+      canvas.drawLine(Offset(0, centerY), Offset(size.width, centerY), centerPaint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _WaveformFillOptimizedPainter old) {
+    // Repaint when gain or size-affecting params change, or when source array identity changes
+    return identical(magnitude, old.magnitude) == false ||
+        gainDb != old.gainDb ||
+        compressionStrength != old.compressionStrength ||
+        edgeMarginPx != old.edgeMarginPx ||
+  visualScale != old.visualScale ||
+        fillColor != old.fillColor ||
+        strokeColor != old.strokeColor ||
+        drawStroke != old.drawStroke;
+  }
+}
 class _PitchFader extends StatelessWidget {
   final AudioSample sample;
   final ValueChanged<double> onChanged;

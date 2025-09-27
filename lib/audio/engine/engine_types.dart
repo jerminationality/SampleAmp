@@ -24,6 +24,9 @@ abstract class AudioEngine {
   Future<Duration> position();
   Future<Duration> duration();
 
+  /// Whether the engine requires a startup volume ramp to avoid pops.
+  bool get needsStartupRamp => true;
+
   // --- Optional DSP support hooks ---
   // Engines that can process raw PCM can override these. Default is no-op.
   bool get supportsDsp => false;
@@ -32,7 +35,4 @@ abstract class AudioEngine {
   Future<void> processOffline(dynamic graph, String inputPath, String outputPath) async {
     throw UnimplementedError('Offline DSP not supported by this engine');
   }
-
-  /// Whether the engine needs ramp-in warmups to avoid pops.
-  bool get needsStartupRamp => true;
 }

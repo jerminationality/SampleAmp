@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import '../providers/audio_provider.dart';
+import 'package:live_audio_sampler/providers/audio_provider.dart';
 
 class EffectsPanel extends StatelessWidget {
   const EffectsPanel({super.key});
@@ -47,14 +47,32 @@ class EffectsPanel extends StatelessWidget {
           ),
           
           const SizedBox(height: 16),
-          
           // Effects controls
           Expanded(
             child: Consumer<AudioProvider>(
               builder: (context, audioProvider, child) {
                 return Row(
                   children: [
-                    // Volume control
+                    // Visual latency compensation (ms)
+                    Expanded(
+                      child: _buildEffectControl(
+                        context,
+                        icon: Icons.timelapse,
+                        label: 'Latency',
+                        value: audioProvider.latencyCompensation.inMilliseconds.toDouble(),
+                        min: 0.0,
+                        max: 200.0,
+                        divisions: 40,
+                        onChanged: (v) => audioProvider.setLatencyCompensation(
+                          Duration(milliseconds: v.round()),
+                        ),
+                        valueLabel: '${audioProvider.latencyCompensation.inMilliseconds} ms',
+                        useStickySnap: true,
+                        snapValue: 0.0,
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    // Volume control (sticky center at 1.0)
                     Expanded(
                       child: _buildEffectControl(
                         context,
@@ -66,12 +84,12 @@ class EffectsPanel extends StatelessWidget {
                         divisions: 40,
                         onChanged: audioProvider.setVolume,
                         valueLabel: '${(audioProvider.volume * 100).round()}%',
+                        useStickySnap: true,
+                        snapValue: 1.0,
                       ),
                     ),
-                    
                     const SizedBox(width: 16),
-                    
-                    // Pitch control
+                    // Pitch control (no sticky)
                     Expanded(
                       child: _buildEffectControl(
                         context,
@@ -83,11 +101,10 @@ class EffectsPanel extends StatelessWidget {
                         divisions: 30,
                         onChanged: audioProvider.setPitch,
                         valueLabel: '${audioProvider.pitch.toStringAsFixed(2)}x',
+                        useStickySnap: false,
                       ),
                     ),
-                    
                     const SizedBox(width: 16),
-                    
                     // Reverb control
                     Expanded(
                       child: _buildEffectControl(
@@ -102,9 +119,7 @@ class EffectsPanel extends StatelessWidget {
                         valueLabel: '${(audioProvider.reverb * 100).round()}%',
                       ),
                     ),
-                    
                     const SizedBox(width: 16),
-                    
                     // Echo control
                     Expanded(
                       child: _buildEffectControl(
@@ -139,6 +154,8 @@ class EffectsPanel extends StatelessWidget {
     required int divisions,
     required ValueChanged<double> onChanged,
     required String valueLabel,
+  bool useStickySnap = false,
+  double? snapValue,
   }) {
     return Column(
       children: [
@@ -149,13 +166,13 @@ class EffectsPanel extends StatelessWidget {
             Icon(
               icon,
               size: 16,
-              color: Theme.of(context).colorScheme.onSurface.withOpacity(0.7),
+              color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.7),
             ),
             const SizedBox(width: 4),
             Text(
               label,
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: Theme.of(context).colorScheme.onSurface.withOpacity(0.7),
+                color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.7),
               ),
             ),
           ],
@@ -177,17 +194,26 @@ class EffectsPanel extends StatelessWidget {
                   overlayRadius: 12,
                 ),
                 activeTrackColor: Theme.of(context).colorScheme.primary,
-                inactiveTrackColor: Theme.of(context).colorScheme.outline.withOpacity(0.3),
+                inactiveTrackColor: Theme.of(context).colorScheme.outline.withValues(alpha: 0.3),
                 thumbColor: Theme.of(context).colorScheme.primary,
-                overlayColor: Theme.of(context).colorScheme.primary.withOpacity(0.2),
+                overlayColor: Theme.of(context).colorScheme.primary.withValues(alpha: 0.2),
               ),
-              child: Slider(
-                value: value,
-                min: min,
-                max: max,
-                divisions: divisions,
-                onChanged: onChanged,
-              ),
+              child: useStickySnap
+                  ? _StickySlider(
+                      value: value,
+                      min: min,
+                      max: max,
+                      divisions: divisions,
+                      onChanged: onChanged,
+                      snapValue: snapValue ?? ((min + max) / 2),
+                    )
+                  : Slider(
+                      value: value,
+                      min: min,
+                      max: max,
+                      divisions: divisions,
+                      onChanged: onChanged,
+                    ),
             ),
           ),
         ),
@@ -198,7 +224,7 @@ class EffectsPanel extends StatelessWidget {
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
           decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.primary.withOpacity(0.1),
+            color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.1),
             borderRadius: BorderRadius.circular(12),
           ),
           child: Text(
@@ -213,3 +239,99 @@ class EffectsPanel extends StatelessWidget {
     );
   }
 } 
+
+class _StickySlider extends StatefulWidget {
+  const _StickySlider({
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.divisions,
+    required this.onChanged,
+    required this.snapValue,
+  });
+
+  final double value;
+  final double min;
+  final double max;
+  final int divisions;
+  final ValueChanged<double> onChanged;
+  final double snapValue;
+
+  @override
+  State<_StickySlider> createState() => _StickySliderState();
+}
+
+class _StickySliderState extends State<_StickySlider> {
+  bool _stuckAtSnap = false;
+
+  double get _step => (widget.max - widget.min) / widget.divisions;
+
+  // Enter window: very small (avoid early snap while approaching)
+  double get _enterWindow => (_step * 0.05).clamp(0.0005, 0.0025);
+
+  // Exit window: strong resistance (~2.5 steps) so it stays sticky once reached
+  double get _exitWindow => _step * 2.5;
+
+  void _handleChanged(double raw) {
+    double out = raw;
+
+    // Determine stickiness transitions
+    if (_stuckAtSnap) {
+      // Stay stuck until outside of exit window
+      if ((raw - widget.snapValue).abs() > _exitWindow) {
+        _stuckAtSnap = false;
+        out = raw;
+      } else {
+  // While stuck, bias toward exact snap to avoid jitter at tick boundaries
+  out = widget.snapValue;
+      }
+    } else {
+      // Only stick if extremely close to exact snap (no early jump)
+      if ((raw - widget.snapValue).abs() <= _enterWindow) {
+        _stuckAtSnap = true;
+        out = widget.snapValue;
+      }
+    }
+
+    // Forward adjusted value
+    if (out != widget.value) {
+      widget.onChanged(out);
+    } else {
+      // still notify on drag to keep provider hot? skip to reduce churn
+    }
+    setState(() {}); // update local sticky state
+  }
+
+  @override
+  void didUpdateWidget(covariant _StickySlider oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // If external value set to snap, mark stuck; if far, release
+    if ((widget.value - widget.snapValue).abs() <= _enterWindow) {
+      _stuckAtSnap = true;
+    }
+    if ((widget.value - widget.snapValue).abs() > _exitWindow) {
+      _stuckAtSnap = false;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Slider(
+      value: widget.value,
+      min: widget.min,
+      max: widget.max,
+      divisions: widget.divisions,
+      onChanged: _handleChanged,
+      onChangeStart: (_) {
+        _stuckAtSnap = (widget.value - widget.snapValue).abs() <= _enterWindow;
+      },
+      onChangeEnd: (_) {
+        // keep stuck if near, otherwise release
+        if ((widget.value - widget.snapValue).abs() > _exitWindow) {
+          _stuckAtSnap = false;
+        }
+        setState(() {});
+      },
+    );
+  }
+}
