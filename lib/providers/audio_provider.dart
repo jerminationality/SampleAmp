@@ -9,11 +9,17 @@ import 'package:audio_session/audio_session.dart';
 
 import 'package:live_audio_sampler/audio/engine/engine_factory.dart';
 import 'package:live_audio_sampler/audio/engine/engine_types.dart';
-import 'package:live_audio_sampler/audio/engine/soloud_engine.dart';
+// import removed: no just_audio shim usage in SoLoud-only path
 import 'package:live_audio_sampler/audio/engine/soloud_ffi_engine.dart';
 import 'package:live_audio_sampler/audio/dsp/dsp_graph.dart';
+import 'package:live_audio_sampler/audio/engine/sound_props.dart';
 
 class AudioProvider with ChangeNotifier {
+  // Singleton to avoid multiple engine instances
+  static final AudioProvider _singleton = AudioProvider._();
+  factory AudioProvider() => _singleton;
+  AudioProvider._();
+
   AudioEngine? _engine; // lazy
   // No direct just_audio usage. Target backend is SoLoud; use engine APIs only.
   // No direct backend-specific player exposure on unified provider.
@@ -77,8 +83,11 @@ class AudioProvider with ChangeNotifier {
   Duration get latencyCompensation => _latencyCompensation;
   DspGraph? get dspGraph => _dspGraph;
 
-  AudioProvider() {
-    _initializePlayer();
+  // kick off initialization lazily
+  void ensureInitialized() {
+    if (_engine == null) {
+      _initializePlayer();
+    }
   }
 
   /// Adjust visual latency compensation used by UI when rendering positions.
@@ -87,6 +96,11 @@ class AudioProvider with ChangeNotifier {
     _latencyCompensation = value < Duration.zero ? Duration.zero : value;
     notifyListeners();
   }
+
+  // Preload state
+  final Map<String, SoundProps> _cachedSounds = <String, SoundProps>{};
+  bool _isPreloading = false;
+  bool get isPreloading => _isPreloading;
 
   Future<void> _initializePlayer() async {
     // Configure audio session (important on Android/iOS for playback)
@@ -112,35 +126,22 @@ class AudioProvider with ChangeNotifier {
   // Init engine (no-op for JA backend)
   _engine ??= createAudioEngine();
   if (kDebugMode) {
-    // ignore: avoid_print
-    print('[AudioProvider] attempting engine init: ${_engine.runtimeType}');
+    debugPrint('[AudioProvider] attempting engine init: ${_engine.runtimeType}');
   }
   try {
     await _engine!.init();
   } catch (e, stack) {
-  if (kDebugMode) {
-      // ignore: avoid_print
-      print('[AudioProvider] primary engine init failed: ${e.runtimeType}: $e');
-      // ignore: avoid_print
-      print(stack);
-      // ignore: avoid_print
-      print('[AudioProvider] falling back to SoLoudEngine (just_audio shim)');
+    // Hard fail; we only support SoLoud path now
+    if (kDebugMode) {
+      debugPrint('[AudioProvider] SoLoud engine init failed: ${e.runtimeType}: $e');
+      debugPrint('$stack');
     }
-    try {
-      _engine = SoLoudEngine();
-      await _engine!.init();
-    } catch (_) {
-      rethrow; // escalate if even fallback fails
-    }
+    rethrow;
   }
   if (kDebugMode) {
     final engine = _engine;
     if (engine is SoLoudFfiEngine) {
-      // ignore: avoid_print
-      print('[AudioProvider] active audio engine=SoLoud backend=${engine.debugBackendName ?? 'unknown'} (id=${engine.debugBackendId ?? -1}) sr=${engine.debugBackendSamplerate ?? 0} buf=${engine.debugBackendBufferSize ?? 0} ch=${engine.debugBackendChannels ?? 0}');
-    } else {
-      // ignore: avoid_print
-      print('[AudioProvider] active audio engine=${engine.runtimeType}');
+      debugPrint('[AudioProvider] active audio engine=SoLoud backend=${engine.debugBackendName ?? 'unknown'} (id=${engine.debugBackendId ?? -1}) sr=${engine.debugBackendSamplerate ?? 0} buf=${engine.debugBackendBufferSize ?? 0} ch=${engine.debugBackendChannels ?? 0}');
     }
   }
   // Create default DSP graph if supported in future; currently always instantiate
@@ -165,6 +166,32 @@ class AudioProvider with ChangeNotifier {
         _updateDuration(dur);
       } catch (_) {}
     });
+  }
+
+  // Preload all known non-blank samples to memory for instant playback
+  Future<void> preloadAll(List<AudioSample> samples) async {
+    if (_engine is! SoLoudFfiEngine) return;
+    final ffiEngine = _engine as SoLoudFfiEngine;
+    _isPreloading = true;
+    notifyListeners();
+    try {
+      await Future.wait(samples.where((s) => !s.isBlank && s.filePath.isNotEmpty).map((s) async {
+        final path = s.filePath;
+        if (_cachedSounds.containsKey(path)) return;
+        await ffiEngine.load(path); // will use internal cache
+        final handle = (ffiEngine.debugCache[path]) ?? (ffiEngine as dynamic)._currentHandle as int?;
+        if (handle != null) {
+          _cachedSounds[path] = SoundProps(
+            path: path,
+            handle: handle,
+            duration: await _engine!.duration(),
+          );
+        }
+      }));
+    } finally {
+      _isPreloading = false;
+      notifyListeners();
+    }
   }
 
   Future<void> _ensureSessionActive() async {
@@ -329,13 +356,29 @@ class AudioProvider with ChangeNotifier {
       // SoLoud-first behavior: load full file, apply clip via engine.setClip
   await _engine!.load(sample.filePath, start: Duration.zero, end: null);
   if (token != _loadToken) return; // a newer load started; abort
-  if (sample.isTrimmed) {
-        final effectiveEnd = (sample.endTime > Duration.zero && sample.endTime < sample.duration)
-            ? sample.endTime
-            : sample.duration;
-  await _engine!.setClip(start: sample.startTime, end: effectiveEnd);
-      } else {
-  await _engine!.setClip(start: null, end: null);
+      // Query engine-reported duration as soon as we load; some samples may have unknown duration in model
+      try {
+        final d = await _engine!.duration();
+        if (d > Duration.zero) {
+          _updateDuration(d);
+          // If trim markers exist, apply them against the engine duration
+          final bool hasTrim = sample.startTime > Duration.zero ||
+              (sample.endTime > Duration.zero && sample.endTime < d);
+          if (hasTrim) {
+            final effectiveEnd = (sample.endTime > Duration.zero && sample.endTime < d)
+                ? sample.endTime
+                : d;
+            await _engine!.setClip(start: sample.startTime, end: effectiveEnd);
+          } else {
+            await _engine!.setClip(start: null, end: null);
+          }
+        } else {
+          // Duration unknown; keep any existing clip intent off for now
+          await _engine!.setClip(start: null, end: null);
+        }
+      } catch (_) {
+        // Best-effort; keep clip cleared on failure
+        try { await _engine!.setClip(start: null, end: null); } catch (_) {}
       }
   if (token != _loadToken) return;
   // Engine loaded source
@@ -350,9 +393,13 @@ class AudioProvider with ChangeNotifier {
   // Applied sample gain: ${sample.gainDb} dB
 
       // Always start at the beginning for a fresh load to avoid end-of-clip no-audio on first tap
-      if (sample.isTrimmed) {
+  // Seek to intended start; if trimmed and we know engine duration, start at clip start (0 relative)
+  final Duration engineDur = _duration;
+  final bool isTrimmedNow = sample.startTime > Duration.zero ||
+      (sample.endTime > Duration.zero && (engineDur == Duration.zero ? false : sample.endTime < engineDur));
+  if (isTrimmedNow) {
         // Clip-relative: start from 0 within the clip window
-        final Duration relStart = Duration.zero;
+  const Duration relStart = Duration.zero;
   await _engine!.seek(relStart);
         _position = relStart;
       } else {
@@ -381,15 +428,23 @@ class AudioProvider with ChangeNotifier {
       // Compute effective target volume before starting (master * normalized gain)
   double effectiveTargetVolume() => (_volume.clamp(0.0, 1.0)) * _gainAmplitude(_currentSample!.gainDb) * _headroom;
 
-      final start = _currentSample!.startTime;
-      final end = (_currentSample!.endTime > Duration.zero && _currentSample!.endTime < _currentSample!.duration)
-          ? _currentSample!.endTime
-          : _currentSample!.duration;
+    final start = _currentSample!.startTime;
+    // Prefer engine-reported duration if available
+    final Duration modelDur = _currentSample!.duration;
+    final Duration effectiveDur = (_duration > Duration.zero) ? _duration : modelDur;
+    final end = (_currentSample!.endTime > Duration.zero && _currentSample!.endTime < effectiveDur)
+      ? _currentSample!.endTime
+      : effectiveDur;
   // debug
   // print('play(): pos=${_position.inMilliseconds} start=${start.inMilliseconds} end=${end.inMilliseconds}');
       if (start >= end) {
-  // startTime >= endTime. Will not play.
-        return;
+        if (kDebugMode) {
+          debugPrint('[AudioProvider] play guard: start>=end (start=${start.inMilliseconds}ms, end=${end.inMilliseconds}ms, engineDur=${_duration.inMilliseconds}ms, modelDur=${modelDur.inMilliseconds}ms)');
+        }
+        // Attempt to reset clip and try a best-effort play from 0
+        try { await _engine!.setClip(start: null, end: null); } catch (_) {}
+        await _engine!.seek(Duration.zero);
+        // Continue to play with ramp below
       }
       
       // Always clamp and seek before play to ensure backend starts reliably
@@ -424,6 +479,8 @@ class AudioProvider with ChangeNotifier {
   final targetVol = effectiveTargetVolume();
   final bool engineNeedsRamp = _engine?.needsStartupRamp ?? true;
   if (!engineNeedsRamp) {
+    // Enforce single-instance per sample: stop any currently active voice
+    try { await _engine!.stop(); } catch (_) {}
     await _engine!.setVolume(targetVol);
     _isPlaying = true;
     await _engine!.play();
@@ -439,6 +496,7 @@ class AudioProvider with ChangeNotifier {
       if (v.isNaN || v.isInfinite) return 0.01;
       return v.clamp(0.005, 0.05);
     })();
+    try { await _engine!.stop(); } catch (_) {}
   await _engine!.setVolume(eps);
     _isPlaying = true;
   await _engine?.play();
@@ -473,6 +531,7 @@ class AudioProvider with ChangeNotifier {
   await _rampVolume(eps, targetVol, totalDuration: const Duration(milliseconds: 60), steps: 8);
   _audibleStarted = true;
   } else {
+    try { await _engine!.stop(); } catch (_) {}
   await _engine!.setVolume(0.0);
     _isPlaying = true;
   await _engine!.play();

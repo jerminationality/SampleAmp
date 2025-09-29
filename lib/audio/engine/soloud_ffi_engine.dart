@@ -12,6 +12,9 @@ class SoLoudFfiEngine implements AudioEngine {
   bool _initialized = false;
   ffi.Pointer<ffi.Void>? _soloud;
   int? _currentHandle;
+  // Simple in-memory cache of loaded sounds (handles) per absolute path
+  final Map<String, int> _cache = <String, int>{};
+  Map<String, int> get debugCache => Map.unmodifiable(_cache);
   bool _playing = false;
   Duration _position = Duration.zero; // Placeholder until native time query added
   Duration _duration = Duration.zero; // Updated after load (TODO query)
@@ -96,6 +99,8 @@ class SoLoudFfiEngine implements AudioEngine {
   @override
   Future<void> dispose() async {
     try {
+      // No explicit free-sound API available in current bindings; if added, iterate _cache here
+      _cache.clear();
       if (_soloud != null) {
         SoLoudFfi.instance.destroy(_soloud!);
       }
@@ -118,7 +123,13 @@ class SoLoudFfiEngine implements AudioEngine {
     final engine = _requireEngine();
     final cPath = path.toNativeUtf8();
     try {
-      final h = SoLoudFfi.instance.load(engine, cPath.cast());
+      int h;
+      if (_cache.containsKey(path)) {
+        h = _cache[path]!;
+      } else {
+        h = SoLoudFfi.instance.load(engine, cPath.cast());
+        if (h >= 0) _cache[path] = h;
+      }
       if (kDebugMode) {
         // ignore: avoid_print
         print('[SoLoudFfiEngine] load request: $path');
@@ -138,10 +149,40 @@ class SoLoudFfiEngine implements AudioEngine {
     }
   }
 
+  // Helper to release a single cached sound if we expose such API in future
+  void releaseCached(String path) {
+    _cache.remove(path);
+  }
+
+  // Public helper to ensure a path is preloaded and return its handle.
+  Future<int> preload(String path) async {
+    if (!_initialized) await init();
+    if (_cache.containsKey(path)) return _cache[path]!;
+    await load(path);
+    return _cache[path] ?? _currentHandle ?? -1;
+  }
+
+  // Public helper to play a specific cached handle without changing clip/seek.
+  Future<void> playHandle(int handle) async {
+    final engine = _requireEngine();
+    SoLoudFfi.instance.play(engine, handle);
+    _playing = true;
+  }
+
+  // Convenience: ensure cached by path and trigger.
+  Future<void> playCached(String path) async {
+    final h = await preload(path);
+    if (h >= 0) await playHandle(h);
+  }
+
   @override
   Future<void> play() async {
     if (_currentHandle != null) {
       final engine = _requireEngine();
+      // Ensure only one instance of this sound is active: stop any existing voices for this handle
+      try {
+        SoLoudFfi.instance.stop(engine, _currentHandle!);
+      } catch (_) {}
       SoLoudFfi.instance.play(engine, _currentHandle!);
       if (kDebugMode) {
         // ignore: avoid_print
@@ -182,8 +223,10 @@ class SoLoudFfiEngine implements AudioEngine {
   @override
   Future<void> setVolume(double volume) async {
     _volume = volume;
+    if (!_initialized || _soloud == null) return;
     final engine = _requireEngine();
-    SoLoudFfi.instance.setGlobalVolume(engine, volume.toDouble());
+    final v = volume.isNaN || volume.isInfinite ? 1.0 : volume.clamp(0.0, 1.0);
+    SoLoudFfi.instance.setGlobalVolume(engine, v.toDouble());
   }
 
   @override
@@ -225,6 +268,7 @@ class SoLoudFfiEngine implements AudioEngine {
 
   @override
   Future<Duration> position() async {
+    if (!_initialized || _soloud == null) return _position;
     if (_currentHandle != null) {
       final engine = _requireEngine();
       final sec = SoLoudFfi.instance.position(engine, _currentHandle!);
@@ -235,6 +279,7 @@ class SoLoudFfiEngine implements AudioEngine {
 
   @override
   Future<Duration> duration() async {
+    if (!_initialized || _soloud == null) return _duration;
     if (_currentHandle != null) {
       final engine = _requireEngine();
       final sec = SoLoudFfi.instance.duration(engine, _currentHandle!);
