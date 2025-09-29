@@ -5,6 +5,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path_provider/path_provider.dart';
 import '../models/audio_sample.dart';
 
+// Optional runtime toggle: wipe saved samples on launch.
+// Enable with: flutter run --dart-define=RESET_ON_LAUNCH=true
+const bool _kResetOnLaunch = bool.fromEnvironment('RESET_ON_LAUNCH', defaultValue: false);
+
 class SampleProvider with ChangeNotifier {
   Map<String, List<AudioSample>> _pageSamples = {}; // Each page has its own list
   List<AudioSample> _filteredSamples = [];
@@ -79,13 +83,22 @@ class SampleProvider with ChangeNotifier {
   }
 
   SampleProvider() {
-    // clearAllSamples(); // Always start with a single empty page
     _initializeProvider();
   }
 
   // Initialize the provider asynchronously
   Future<void> _initializeProvider() async {
-    // await _clearSavedSamples(); // Remove saved samples from persistent storage
+    // In debug builds or when explicitly requested via dart-define, clear saved samples.
+    if (kDebugMode || _kResetOnLaunch) {
+      try {
+        await _clearSavedSamples();
+        clearAllSamples();
+        if (kDebugMode) {
+          // ignore: avoid_print
+          print('[SampleProvider] reset-on-launch enabled (kDebugMode=${kDebugMode ? 'true' : 'false'}, RESET_ON_LAUNCH=${_kResetOnLaunch ? 'true' : 'false'})');
+        }
+      } catch (_) {}
+    }
     await _loadSamples();
   }
 

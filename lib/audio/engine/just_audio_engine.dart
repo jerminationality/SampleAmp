@@ -9,6 +9,9 @@ class JustAudioEngine implements AudioEngine {
   dynamic get debugDspGraph => _dspGraph;
 
   @override
+  bool get needsStartupRamp => false;
+
+  @override
   Future<void> init() async {}
 
   @override

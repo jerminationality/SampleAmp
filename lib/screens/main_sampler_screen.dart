@@ -200,6 +200,10 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
 
       _audioProviderRef = Provider.of<AudioProvider>(context, listen: false);
       _audioProviderRef!.addListener(_handleAudioProviderUpdate);
+      // Kick off SoLoud preload of current page samples for low latency once both providers exist
+      final samples = _sampleProviderRef!.currentPageSamples;
+      _audioProviderRef!.ensureInitialized();
+      _audioProviderRef!.preloadAll(samples);
     });
   }
 
@@ -414,6 +418,13 @@ class _MainSamplerScreenState extends State<MainSamplerScreen> {
       builder: (context, constraints) {
         return Column(
           children: [
+            // Show a slim loading bar during audio preload
+            Consumer<AudioProvider>(builder: (context, audioProvider, _) {
+              if (audioProvider.isPreloading) {
+                return const LinearProgressIndicator(minHeight: 2);
+              }
+              return const SizedBox.shrink();
+            }),
             // Sample grid container with background
             Expanded(
               child: Container(
