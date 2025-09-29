@@ -30,7 +30,7 @@ class _SampleButtonState extends State<SampleButton>
   static OverlayEntry? _activeMenuEntry;
   late AnimationController _animationController;
   late Animation<double> _scaleAnimation;
-  final bool _isPressed = false;
+  bool _pressed = false;
   final LayerLink _layerLink = LayerLink();
 
   @override
@@ -81,98 +81,120 @@ class _SampleButtonState extends State<SampleButton>
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<AudioProvider>(
-      builder: (context, audioProvider, _) {
-        return CompositedTransformTarget(
-          link: _layerLink,
-          child: GestureDetector(
-            onTap: _playSample,
-            onLongPress: _onLongPress,
-            child: AnimatedBuilder(
-              animation: _scaleAnimation,
-              builder: (context, child) {
-                return Transform.scale(
-                  scale: _scaleAnimation.value,
-                  child: Stack(
-                    children: [
-                      Container(
-                    decoration: BoxDecoration(
-                      color: _getButtonColor(),
-                      borderRadius: BorderRadius.circular(2),
-                      border: Border.all(
-                        color: widget.selectedSampleId == widget.sample.id ? Colors.yellow : Colors.transparent,
-                        width: widget.selectedSampleId == widget.sample.id ? 1 : 0,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.2),
-                          blurRadius: 8,
-                          offset: const Offset(0, 4),
-                        ),
-                      ],
-                    ),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(
-                          _getSampleIcon(),
-                          size: 32,
-                          color: _getIconColor(),
-                        ),
-                        const SizedBox(height: 8),
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 8),
-                          child: Text(
-                            _getDisplayText(),
-                            style: TextStyle(
-                              color: _getTextColor(),
-                              fontSize: 12,
-                              fontWeight: FontWeight.bold,
-                            ),
-                            textAlign: TextAlign.center,
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        if (!widget.sample.isBlank) ...[
-                        ],
-                        if (widget.sample.isFavorite)
-                          const Icon(
-                            Icons.favorite,
-                            size: 16,
-                            color: Colors.red,
-                          ),
-                      ],
-                    ),
-                      ),
-                      // Loading spinner removed per request
-                    ],
-                  ),
-                );
-              },
-            ),
+    return CompositedTransformTarget(
+      link: _layerLink,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTapDown: (details) {
+          // Ultra-fast feedback: start press state and scale first
+          if (mounted) setState(() => _pressed = true);
+          _animationController.forward();
+          _playSample();
+        },
+        onTapUp: (_) {
+          if (mounted) setState(() => _pressed = false);
+          _animationController.reverse();
+        },
+        onTapCancel: () {
+          if (mounted) setState(() => _pressed = false);
+          _animationController.reverse();
+        },
+        onLongPress: _onLongPress,
+        child: AnimatedBuilder(
+          animation: _scaleAnimation,
+          // Only rebuild the Transform; keep the button face as child
+          builder: (context, child) => Transform.scale(
+            scale: _scaleAnimation.value,
+            child: child,
           ),
-        );
-      },
+          child: _buildButtonFace(),
+        ),
+      ),
     );
   }
 
-  Color _getButtonColor() {
-    final audioProvider = Provider.of<AudioProvider>(context, listen: false);
-    final isPlayingSample = audioProvider.playingSample?.id == widget.sample.id;
-    final isPlaying = audioProvider.isPlaying && isPlayingSample;
+  // Build only the parts that need to react to provider changes using a narrow Selector
+  Widget _buildButtonFace() {
+    return Stack(
+      children: [
+        Selector<AudioProvider, bool>(
+          selector: (_, ap) => ap.isPlaying && ap.playingSample?.id == widget.sample.id,
+          shouldRebuild: (prev, next) => prev != next,
+          builder: (context, isPlayingThis, _) {
+            final bg = _computeButtonColor(context, isPlayingThis, _pressed);
+            final iconColor = _computeIconColor(bg);
+            final textColor = _computeTextColor(bg);
+            return RepaintBoundary(
+              child: Container(
+              decoration: BoxDecoration(
+                color: bg,
+                borderRadius: BorderRadius.circular(2),
+                border: Border.all(
+                  color: widget.selectedSampleId == widget.sample.id ? Colors.yellow : Colors.transparent,
+                  width: widget.selectedSampleId == widget.sample.id ? 1 : 0,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.2),
+                    blurRadius: 8,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    _getSampleIcon(),
+                    size: 32,
+                    color: iconColor,
+                  ),
+                  const SizedBox(height: 8),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    child: Text(
+                      _getDisplayText(),
+                      style: TextStyle(
+                        color: textColor,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      textAlign: TextAlign.center,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  if (!widget.sample.isBlank) ...[
+                  ],
+                  if (widget.sample.isFavorite)
+                    const Icon(
+                      Icons.favorite,
+                      size: 16,
+                      color: Colors.red,
+                    ),
+                ],
+              ),
+              ),
+            );
+          },
+        ),
+        // Loading spinner removed per request
+      ],
+    );
+  }
 
+  Color _computeButtonColor(BuildContext context, bool isPlaying, bool isPressed) {
     if (isPlaying) {
       return Theme.of(context).colorScheme.primary;
-    } else if (_isPressed) {
-  return Theme.of(context).colorScheme.primary.withValues(alpha: 0.7);
+    } else if (isPressed) {
+      return Theme.of(context).colorScheme.primary.withValues(alpha: 0.7);
     } else if (!widget.sample.isBlank) {
       // For active samples, use custom color as background if available
       if (widget.sample.customColor != null) {
         return Color(widget.sample.customColor!);
       }
       // Active sample buttons (with audio) get a solid background color
-  return Theme.of(context).colorScheme.outline.withValues(alpha: 0.3);
+      return Theme.of(context).colorScheme.outline.withValues(alpha: 0.3);
     } else {
       // Blank samples always use surface color for background
       return Theme.of(context).colorScheme.surface;
@@ -181,22 +203,20 @@ class _SampleButtonState extends State<SampleButton>
 
   // _getBorderColor is no longer needed
 
-  Color _getIconColor() {
+  Color _computeIconColor(Color bg) {
     // Force white on default fill for active samples without custom color
     if (!widget.sample.isBlank && widget.sample.customColor == null) {
       return Colors.white;
     }
-    final bg = _getButtonColor();
     // Derive foreground for icon based on actual background for best readability
     return _bestForegroundOn(bg);
   }
 
-  Color _getTextColor() {
+  Color _computeTextColor(Color bg) {
     // Force white on default fill for active samples without custom color
     if (!widget.sample.isBlank && widget.sample.customColor == null) {
       return Colors.white;
     }
-    final bg = _getButtonColor();
     return _bestForegroundOn(bg);
   }
 
